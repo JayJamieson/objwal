@@ -10,7 +10,7 @@ object store that supports conditional writes (S3 `If-Match`/`If-None-Match`).
 ## Lineage: from the opendata buffer
 
 objwal descends from a Go port of the Rust [opendata-buffer](https://github.com/opendata-oss/opendata/tree/main/buffer). All credit
-should go to the team at pendata.
+should go to the team at [opendata](https://www.opendata.dev/).
 
 A stateless, broker-less queue over object storage, where producers append
 batches and a single fenced consumer destructively dequeues them. We kept the
@@ -93,17 +93,17 @@ linear.
 
 ```go
 import (
-	"github.com/JayJamieson/objwal/objectstore"
-	"github.com/JayJamieson/objwal/wal"
+ "github.com/JayJamieson/objwal/objectstore"
+ "github.com/JayJamieson/objwal/wal"
 )
 
 store := objectstore.NewInMemory() // or objectstore.NewS3(client, bucket)
 
 p, err := wal.NewProducer(ctx, store, wal.ProducerConfig{
-	ManifestPath:  "wal/manifest",
-	SegmentPrefix: "wal/seg",
-	FlushInterval: 50 * time.Millisecond,
-	FlushBytes:    8 << 20, // seal a segment early at 8 MiB buffered
+ ManifestPath:  "wal/manifest",
+ SegmentPrefix: "wal/seg",
+ FlushInterval: 50 * time.Millisecond,
+ FlushBytes:    8 << 20, // seal a segment early at 8 MiB buffered
 })
 if err != nil { ... } // wal.ErrFenced => a newer primary already claimed the log
 
@@ -132,15 +132,15 @@ a handler (apply the op to your system):
 
 ```go
 applier := wal.TypedApplier(
-	decodeOp, // func([]byte) (Op, error) mirrors however you framed the record
-	func(ctx context.Context, seq uint64, op Op) error {
-		return db.Apply(op) // your Bitcask / SQLite / cache / KV store
-	},
+ decodeOp, // func([]byte) (Op, error) mirrors however you framed the record
+ func(ctx context.Context, seq uint64, op Op) error {
+  return db.Apply(op) // your Bitcask / SQLite / cache / KV store
+ },
 )
 
 r := wal.NewReplica(store, applier, wal.ReplicaConfig{
-	ManifestPath: "wal/manifest",
-	Cursor:       wal.NewFileCursorStore("/var/lib/app/wal.cursor"), // resume across restarts
+ ManifestPath: "wal/manifest",
+ Cursor:       wal.NewFileCursorStore("/var/lib/app/wal.cursor"), // resume across restarts
 })
 
 // Tail until ctx is cancelled (or call r.Poll(ctx) yourself to step it).
