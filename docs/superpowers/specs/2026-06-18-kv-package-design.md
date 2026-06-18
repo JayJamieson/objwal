@@ -146,8 +146,13 @@ Implements the agreed rule: **check local, otherwise replay objwal.**
 
 - **Primary** `Open`:
   1. Open the local file and scan it front-to-back, rebuilding the keydir
-     (last record per key wins; `DELETE` removes). A short read or crc mismatch
-     on the final record means a torn tail → truncate the file there and stop.
+     (last record per key wins; `DELETE` removes). The scan stops at the **first**
+     record that fails to validate (short read or crc mismatch) and truncates
+     everything from that point. A length-prefixed log cannot reliably resync
+     past a corrupt record, so a torn tail and (rare) interior corruption are
+     handled identically — the remainder is dropped. A crc-*valid* record with an
+     unknown op byte is instead a hard error (a format mismatch, not a torn
+     write), failing the open rather than silently discarding intact data.
   2. If the local file did not exist / had no records, replay objwal from
      sequence 0 through a one-shot `wal.Replica` (same `Applier`) to rebuild the
      local file and keydir before accepting writes.
