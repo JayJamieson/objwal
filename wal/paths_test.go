@@ -123,8 +123,11 @@ func TestGroupCommitCoalescesAndPreservesMeta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s1 != s2 {
-		t.Fatalf("groups in one segment should share a sequence: %d vs %d", s1, s2)
+	// Per-record sequencing: groupA (r0,r1) starts at the segment base (0); its
+	// Durability reports that first-record sequence. groupB (r2) coalesced into
+	// the same segment but starts at offset 2, so it reports sequence 2.
+	if s1 != 0 || s2 != 2 {
+		t.Fatalf("coalesced Append sequences wrong: groupA=%d (want 0), groupB=%d (want 2)", s1, s2)
 	}
 
 	app := &recordingApplier{}
@@ -136,6 +139,12 @@ func TestGroupCommitCoalescesAndPreservesMeta(t *testing.T) {
 	defer app.mu.Unlock()
 	if len(app.applied) != 3 {
 		t.Fatalf("applied %d records, want 3", len(app.applied))
+	}
+	// Records carry distinct, contiguous per-record sequences 0,1,2.
+	for i := range app.applied {
+		if app.applied[i].Sequence != uint64(i) {
+			t.Fatalf("record %d has sequence %d, want %d", i, app.applied[i].Sequence, i)
+		}
 	}
 	// r0,r1 carry groupA; r2 carries groupB.
 	if string(app.applied[0].GroupMeta) != "groupA" || string(app.applied[1].GroupMeta) != "groupA" {

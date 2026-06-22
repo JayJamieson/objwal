@@ -7,7 +7,7 @@ import (
 	"github.com/JayJamieson/objwal/objectstore"
 )
 
-// Store is the CAS read/commit seam for a manifest object. The writer uses
+// Store is the CAS read/commit handle for a manifest object. The writer uses
 // Commit (PutUpdate against the version observed by Load); the reader uses
 // Load to tail. It is deliberately thin: on a precondition failure the caller
 // re-Loads to get the fresh version and replans, exactly as the buffer does.
