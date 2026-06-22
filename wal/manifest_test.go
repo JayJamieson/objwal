@@ -33,10 +33,10 @@ func TestEmptyManifestRoundTrip(t *testing.T) {
 
 func TestSnapshotPointerRoundTrip(t *testing.T) {
 	m := NewManifest()
-	if _, err := m.Append("seg/0000.batch", []RecordMeta{{StartIndex: 0, IngestionTimeMs: 111, Payload: []byte("a")}}); err != nil {
+	if _, err := m.Append("seg/0000.batch", []RecordMeta{{StartIndex: 0, IngestionTimeMs: 111, Payload: []byte("a")}}, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Append("seg/0001.batch", nil); err != nil {
+	if _, err := m.Append("seg/0001.batch", nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	m.SetEpoch(7)
@@ -72,12 +72,8 @@ func TestSnapshotPointerRoundTrip(t *testing.T) {
 // A v1 (buffer) manifest must parse as a zero-snapshot v2 manifest, so the
 // replica can bootstrap from a plain buffer queue.
 func TestReadsBufferV1Footer(t *testing.T) {
-	// Hand-build a v1 manifest: one entry + 22-byte v1 footer.
-	var body []byte
-	body, err := encodeEntry(body, Entry{Sequence: 0, Location: "x", Metadata: nil})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Hand-build a v1 manifest: one legacy entry (no Count field) + 22-byte v1 footer.
+	body := encodeLegacyEntryForTest(Entry{Sequence: 0, Location: "x", Metadata: nil})
 	buf := append([]byte{}, body...)
 	buf = binary.LittleEndian.AppendUint32(buf, 1)                   // entries_count
 	buf = binary.LittleEndian.AppendUint64(buf, 1)                   // next_sequence
@@ -128,7 +124,7 @@ func TestCoreFooterOffsetsStable(t *testing.T) {
 func TestAppendPreservesSnapshot(t *testing.T) {
 	m := NewManifest()
 	for i := 0; i < 3; i++ {
-		if _, err := m.Append("seg", nil); err != nil {
+		if _, err := m.Append("seg", nil, 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -139,7 +135,7 @@ func TestAppendPreservesSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	seq, err := m.Append("seg/new", nil)
+	seq, err := m.Append("seg/new", nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +157,7 @@ func TestAppendPreservesSnapshot(t *testing.T) {
 func TestTruncateThrough(t *testing.T) {
 	m := NewManifest()
 	for i := 0; i < 5; i++ {
-		if _, err := m.Append("seg", []RecordMeta{{StartIndex: 0, Payload: []byte{byte(i)}}}); err != nil {
+		if _, err := m.Append("seg", []RecordMeta{{StartIndex: 0, Payload: []byte{byte(i)}}}, 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -192,7 +188,7 @@ func TestTruncateThrough(t *testing.T) {
 		t.Fatalf("snapshot lost across truncate: %+v", got.Snapshot())
 	}
 	// A subsequent append continues the sequence.
-	seq, err := got.Append("seg/after", nil)
+	seq, err := got.Append("seg/after", nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +200,7 @@ func TestTruncateThrough(t *testing.T) {
 func TestEntriesAfter(t *testing.T) {
 	m := NewManifest()
 	for i := 0; i < 4; i++ {
-		if _, err := m.Append("seg", nil); err != nil {
+		if _, err := m.Append("seg", nil, 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,7 +226,7 @@ func TestStoreCASRoundTrip(t *testing.T) {
 	if ok || ver != nil {
 		t.Fatal("expected missing manifest on fresh load")
 	}
-	if _, err := m.Append("seg/0", nil); err != nil {
+	if _, err := m.Append("seg/0", nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Create(ctx, m); err != nil {
@@ -243,7 +239,7 @@ func TestStoreCASRoundTrip(t *testing.T) {
 		t.Fatalf("reload failed: ok=%v ver=%v err=%v", ok, ver, err)
 	}
 	m.SetSnapshot(SnapshotPointer{Location: "base.ckpt", ThroughSeq: 0, CreatedUnixMs: 7})
-	if _, err := m.Append("seg/1", nil); err != nil {
+	if _, err := m.Append("seg/1", nil, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Commit(ctx, m, ver); err != nil {
@@ -262,4 +258,22 @@ func TestStoreCASRoundTrip(t *testing.T) {
 	if final.Count() != 2 || final.Snapshot().Location != "base.ckpt" {
 		t.Fatalf("final state wrong: count=%d snap=%+v", final.Count(), final.Snapshot())
 	}
+}
+
+// encodeLegacyEntryForTest writes an entry in the pre-v3 (buffer/v2) layout,
+// without the Count field, to exercise the legacy-read/upgrade path.
+func encodeLegacyEntryForTest(e Entry) []byte {
+	body := make([]byte, 0, 32)
+	body = binary.LittleEndian.AppendUint64(body, e.Sequence)
+	body = binary.LittleEndian.AppendUint16(body, uint16(len(e.Location)))
+	body = append(body, e.Location...)
+	body = binary.LittleEndian.AppendUint32(body, uint32(len(e.Metadata)))
+	for _, md := range e.Metadata {
+		body = binary.LittleEndian.AppendUint32(body, md.StartIndex)
+		body = binary.LittleEndian.AppendUint64(body, uint64(md.IngestionTimeMs))
+		body = binary.LittleEndian.AppendUint32(body, uint32(len(md.Payload)))
+		body = append(body, md.Payload...)
+	}
+	out := binary.LittleEndian.AppendUint32(nil, uint32(len(body)))
+	return append(out, body...)
 }

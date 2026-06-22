@@ -3,20 +3,22 @@
 // The buffer is a destructive single-consumer queue; replication needs a
 // non-destructively *tailed* log with a base snapshot for bootstrap. This
 // package reuses the buffer's object-store abstraction and append-friendly
-// manifest, and extends the manifest with a snapshot pointer (footer v2) so a
-// single CAS-protected object describes both the live WAL tail and the base a
-// new or lagging replica should restore from.
+// manifest, and extends the manifest with a snapshot pointer (footer v2) and
+// per-record sequencing (footer v3) so a single CAS-protected object describes
+// both the live WAL tail and the base a new or lagging replica restores from,
+// and lets a consumer address playback to an individual record sequence.
 //
-//   - Writer (primary): on each write, frames a record and (a) appends it to
-//     its local store and (b) hands it to a buffer-style producer that batches
-//     records into segment objects and CAS-appends entries to this manifest.
-//     The writer is fenced by epoch: a new primary bumps epoch, a stale
-//     primary's CAS appends start failing and it steps down.
-//   - Reader (replica): restores the snapshot at Snapshot().ThroughSeq, then
-//     polls this manifest and applies entries with Sequence > its cursor.
-//   - Snapshot/GC: periodically uploads a base snapshot, records it here via
-//     SetSnapshot, TruncateThrough-es superseded entries out of the manifest,
-//     and lets a time/size policy delete the orphaned segment objects.
+// Sequence model (footer v3): each entry owns a contiguous half-open range of
+// record sequences [Sequence, Sequence+Count). A segment with N framed records
+// advances the log's nextSequence by N, and record i in that segment has
+// sequence Sequence+i. Entries tile the sequence space with no gaps or overlaps,
+// so a consumer can read only the manifest, find the entry whose range contains
+// a target sequence (Locate), and start reading segments from there.
+//
+// Legacy footers (v1 buffer, v2) used one sequence per entry; their entries are
+// read back with Count==0, meaning "this segment occupies a single sequence
+// slot and all its records share that sequence" — the original whole-segment
+// semantics, preserved so old manifests still replay correctly.
 package wal
 
 import (
@@ -25,20 +27,21 @@ import (
 	"math"
 )
 
-// Footer/format constants. Entry encoding is byte-identical to the buffer's
-// v1 manifest entries; only the footer differs (v2 carries a snapshot block).
+// Footer/format constants.
 const (
-	// FooterVersion is the version this package writes.
-	FooterVersion uint16 = 2
-	// bufferFooterVersion is the buffer's v1 footer, which this package can
-	// read (a v1 manifest is simply a v2 manifest with no snapshot block).
-	bufferFooterVersion uint16 = 1
+	// FooterVersion is the version this package writes: v3 carries the snapshot
+	// block (like v2) and per-entry record Count for per-record sequencing.
+	FooterVersion uint16 = 3
+	// snapshotFooterVersion (v2) carries the snapshot block but one sequence per
+	// entry. bufferFooterVersion (v1) is the buffer's footer with neither.
+	snapshotFooterVersion uint16 = 2
+	bufferFooterVersion   uint16 = 1
 
 	entriesCountSize = 4
 	sequenceSize     = 8
 	epochSize        = 8
 	versionSize      = 2
-	// coreFooter is the trailing block shared by v1 and v2, at identical
+	// coreFooter is the trailing block shared by all versions, at identical
 	// offsets from the end of the object.
 	coreFooterSize = entriesCountSize + sequenceSize + epochSize + versionSize // 22
 
@@ -48,6 +51,7 @@ const (
 	snapFixedSize   = snapLocLenSize + snapThroughSize + snapCreatedSize // 18
 
 	locationLenSize   = 2
+	countFieldSize    = 4 // per-entry record Count (v3 entries only)
 	metadataCountSize = 4
 	startIndexSize    = 4
 	ingestionTimeSize = 8
@@ -58,14 +62,8 @@ const (
 // SnapshotPointer identifies the base snapshot a replica bootstraps from.
 // The zero value (empty Location) means "no snapshot has been taken yet".
 type SnapshotPointer struct {
-	// Location is the object path of the snapshot. Empty means none.
-	Location string
-	// ThroughSeq is the highest WAL sequence included in the snapshot. A
-	// replica restores the snapshot, sets its cursor to ThroughSeq, and
-	// applies only entries with Sequence > ThroughSeq.
-	ThroughSeq uint64
-	// CreatedUnixMs is the snapshot's wall-clock creation time, used by the
-	// retention policy.
+	Location      string
+	ThroughSeq    uint64
 	CreatedUnixMs int64
 }
 
@@ -73,8 +71,7 @@ type SnapshotPointer struct {
 func (s SnapshotPointer) IsZero() bool { return s.Location == "" }
 
 // RecordMeta is a per-range annotation attached to a manifest entry,
-// delimiting the run of framed records beginning at StartIndex. It mirrors the
-// buffer's Metadata so segment objects and manifests stay tooling-compatible.
+// delimiting the run of framed records beginning at StartIndex.
 type RecordMeta struct {
 	StartIndex      uint32
 	IngestionTimeMs int64
@@ -82,23 +79,45 @@ type RecordMeta struct {
 }
 
 // Entry is one committed manifest entry: a segment object plus the metadata
-// ranges describing the framed records it holds.
+// ranges describing the framed records it holds. The entry owns the record
+// sequence range [Sequence, Sequence+RangeSize()); record i has sequence
+// Sequence+i. Count is the number of framed records in the segment; Count==0
+// is the legacy per-entry sentinel (one sequence slot, all records share
+// Sequence).
 type Entry struct {
 	Sequence uint64
+	Count    uint32
 	Location string
 	Metadata []RecordMeta
 }
 
+// RangeSize is the number of record sequences the entry occupies: Count for a
+// per-record (v3) entry, or 1 for a legacy (Count==0) entry.
+func (e Entry) RangeSize() uint64 {
+	if e.Count == 0 {
+		return 1
+	}
+	return uint64(e.Count)
+}
+
+// End is the exclusive upper bound of the entry's record-sequence range.
+func (e Entry) End() uint64 { return e.Sequence + e.RangeSize() }
+
+// Contains reports whether record sequence seq falls within this entry.
+func (e Entry) Contains(seq uint64) bool { return seq >= e.Sequence && seq < e.End() }
+
 // Manifest is the in-memory, mutable view of a replication-log manifest. It
 // preserves the buffer's O(1) append shape: existing entries are held as raw
 // bytes (base) and new entries accumulate in a side buffer (appended); only a
-// snapshot change or truncation rewrites base.
+// snapshot change or truncation rewrites base. base/appended are always held in
+// the current (v3) entry encoding; a parsed legacy manifest is normalized on
+// load.
 //
 // Manifest is not safe for concurrent mutation; the writer owns one instance.
 type Manifest struct {
-	base          []byte // encoded existing entries (no snapshot block, no footer)
+	base          []byte
 	baseCount     int
-	appended      []byte // encoded newly appended entries
+	appended      []byte
 	appendedCount int
 	nextSequence  uint64
 	epoch         uint64
@@ -108,29 +127,32 @@ type Manifest struct {
 // NewManifest returns an empty manifest at epoch 0 with no snapshot.
 func NewManifest() *Manifest { return &Manifest{} }
 
-// ParseManifest decodes a serialized manifest. It accepts both v2 (this
-// package) and v1 (the buffer) footers; a v1 manifest yields a zero snapshot.
+// ParseManifest decodes a serialized manifest. It accepts v3 (this package), v2
+// (snapshot, one sequence per entry), and v1 (the buffer). Legacy (v1/v2)
+// entries are normalized in memory to the v3 encoding with Count==0, so all
+// downstream decoding is uniform and a re-commit upgrades the object to v3.
 func ParseManifest(data []byte) (*Manifest, error) {
 	if len(data) < coreFooterSize {
 		return nil, fmt.Errorf("wal: manifest too short for footer (%d bytes)", len(data))
 	}
 	n := len(data)
 	version := binary.LittleEndian.Uint16(data[n-versionSize:])
-	// Core footer sits at identical offsets from the end in v1 and v2.
 	epoch := binary.LittleEndian.Uint64(data[n-versionSize-epochSize : n-versionSize])
 	nextSeq := binary.LittleEndian.Uint64(data[n-versionSize-epochSize-sequenceSize : n-versionSize-epochSize])
-	count := binary.LittleEndian.Uint32(data[n-coreFooterSize : n-coreFooterSize+entriesCountSize])
+	count := int(binary.LittleEndian.Uint32(data[n-coreFooterSize : n-coreFooterSize+entriesCountSize]))
 
-	m := &Manifest{baseCount: int(count), nextSequence: nextSeq, epoch: epoch}
+	m := &Manifest{baseCount: count, nextSequence: nextSeq, epoch: epoch}
 
+	var base []byte
+	hasCount := false
 	switch version {
 	case bufferFooterVersion:
-		m.base = data[:n-coreFooterSize]
-	case FooterVersion:
+		base = data[:n-coreFooterSize]
+	case snapshotFooterVersion, FooterVersion:
 		if n < coreFooterSize+snapFixedSize {
-			return nil, fmt.Errorf("wal: manifest too short for v2 snapshot block (%d bytes)", n)
+			return nil, fmt.Errorf("wal: manifest too short for snapshot block (%d bytes)", n)
 		}
-		snapEnd := n - coreFooterSize // snapshot block ends where the core footer begins
+		snapEnd := n - coreFooterSize
 		createdStart := snapEnd - snapCreatedSize
 		throughStart := createdStart - snapThroughSize
 		locLenStart := throughStart - snapLocLenSize
@@ -142,23 +164,49 @@ func ParseManifest(data []byte) (*Manifest, error) {
 			return nil, fmt.Errorf("wal: snapshot location length %d overruns manifest", locLen)
 		}
 		if locLen > 0 {
-			m.snapshot = SnapshotPointer{
-				Location:      string(data[locStart:locLenStart]),
-				ThroughSeq:    through,
-				CreatedUnixMs: created,
-			}
+			m.snapshot = SnapshotPointer{Location: string(data[locStart:locLenStart]), ThroughSeq: through, CreatedUnixMs: created}
 		} else {
 			m.snapshot = SnapshotPointer{ThroughSeq: through, CreatedUnixMs: created}
-			m.snapshot.Location = "" // explicit: no snapshot
 		}
-		m.base = data[:locStart]
+		base = data[:locStart]
+		hasCount = version == FooterVersion
 	default:
 		return nil, fmt.Errorf("wal: unsupported manifest version %d", version)
 	}
+
+	if hasCount {
+		m.base = base
+		return m, nil
+	}
+	// Legacy: decode without a Count field and re-encode as v3 (Count==0).
+	upgraded, err := upgradeLegacyEntries(base, count)
+	if err != nil {
+		return nil, err
+	}
+	m.base = upgraded
 	return m, nil
 }
 
-// Bytes serializes the manifest in v2 form.
+// upgradeLegacyEntries decodes count legacy entries (no Count field) and
+// re-encodes them in the v3 encoding with Count==0.
+func upgradeLegacyEntries(base []byte, count int) ([]byte, error) {
+	var out []byte
+	off := 0
+	for i := 0; i < count; i++ {
+		e, next, err := decodeEntry(base, off, false)
+		if err != nil {
+			return nil, err
+		}
+		off = next
+		out, err = encodeEntry(out, e) // e.Count == 0
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// Bytes serializes the manifest in v3 form.
 func (m *Manifest) Bytes() ([]byte, error) {
 	total := m.baseCount + m.appendedCount
 	if total > math.MaxUint32 {
@@ -172,12 +220,10 @@ func (m *Manifest) Bytes() ([]byte, error) {
 	buf := make([]byte, 0, size)
 	buf = append(buf, m.base...)
 	buf = append(buf, m.appended...)
-	// snapshot block
 	buf = append(buf, loc...)
 	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(loc)))
 	buf = binary.LittleEndian.AppendUint64(buf, m.snapshot.ThroughSeq)
 	buf = binary.LittleEndian.AppendUint64(buf, uint64(m.snapshot.CreatedUnixMs))
-	// core footer (matches buffer v1 field order)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(total))
 	buf = binary.LittleEndian.AppendUint64(buf, m.nextSequence)
 	buf = binary.LittleEndian.AppendUint64(buf, m.epoch)
@@ -185,18 +231,25 @@ func (m *Manifest) Bytes() ([]byte, error) {
 	return buf, nil
 }
 
-// Append assigns the next sequence to a new entry pointing at a segment object
-// and returns the assigned sequence. The append is O(1): it touches only the
-// side buffer, not base or the snapshot block.
-func (m *Manifest) Append(location string, md []RecordMeta) (uint64, error) {
+// Append assigns a record-sequence range to a new entry pointing at a segment
+// object holding count framed records, and returns the sequence of the first
+// record (the entry's base sequence). nextSequence advances by count. count
+// must be >= 1.
+func (m *Manifest) Append(location string, md []RecordMeta, count int) (uint64, error) {
+	if count < 1 {
+		return 0, fmt.Errorf("wal: Append count must be >= 1, got %d", count)
+	}
+	if count > math.MaxUint32 {
+		return 0, fmt.Errorf("wal: Append count %d exceeds u32 max", count)
+	}
 	seq := m.nextSequence
-	enc, err := encodeEntry(m.appended, Entry{Sequence: seq, Location: location, Metadata: md})
+	enc, err := encodeEntry(m.appended, Entry{Sequence: seq, Count: uint32(count), Location: location, Metadata: md})
 	if err != nil {
 		return 0, err
 	}
 	m.appended = enc
 	m.appendedCount++
-	m.nextSequence++
+	m.nextSequence += uint64(count)
 	return seq, nil
 }
 
@@ -212,24 +265,45 @@ func (m *Manifest) SetEpoch(e uint64) { m.epoch = e }
 // Epoch returns the current fencing epoch.
 func (m *Manifest) Epoch() uint64 { return m.epoch }
 
-// NextSequence returns the sequence the next Append will assign.
+// NextSequence returns the sequence the next appended record will receive.
 func (m *Manifest) NextSequence() uint64 { return m.nextSequence }
 
 // Count returns the number of live entries (base + appended).
 func (m *Manifest) Count() int { return m.baseCount + m.appendedCount }
 
 // Entries decodes and returns all live entries in sequence order.
-func (m *Manifest) Entries() ([]Entry, error) { return m.entriesFrom(0, false) }
+func (m *Manifest) Entries() ([]Entry, error) {
+	out := make([]Entry, 0, m.Count())
+	for _, region := range [][]byte{m.base, m.appended} {
+		off := 0
+		for off < len(region) {
+			e, next, err := decodeEntry(region, off, true)
+			if err != nil {
+				return nil, err
+			}
+			off = next
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
 
 // EntriesAfter returns live entries with Sequence > afterSeq, in order.
 func (m *Manifest) EntriesAfter(afterSeq uint64) ([]Entry, error) {
-	return m.entriesFrom(afterSeq, true)
+	all, err := m.Entries()
+	if err != nil {
+		return nil, err
+	}
+	out := all[:0:0]
+	for _, e := range all {
+		if e.Sequence > afterSeq {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
-// EntriesFrom returns live entries with Sequence >= minSeq, in order. This is
-// the tailer's read path: the replica's half-open cursor is the next sequence
-// it expects to apply, so minSeq == cursor delivers everything not yet seen,
-// including sequence 0.
+// EntriesFrom returns live entries with Sequence >= minSeq, in order.
 func (m *Manifest) EntriesFrom(minSeq uint64) ([]Entry, error) {
 	all, err := m.Entries()
 	if err != nil {
@@ -244,32 +318,56 @@ func (m *Manifest) EntriesFrom(minSeq uint64) ([]Entry, error) {
 	return out, nil
 }
 
-func (m *Manifest) entriesFrom(afterSeq uint64, filter bool) ([]Entry, error) {
-	out := make([]Entry, 0, m.Count())
-	for _, region := range [][]byte{m.base, m.appended} {
-		off := 0
-		for off < len(region) {
-			e, next, err := decodeEntry(region, off)
-			if err != nil {
-				return nil, err
-			}
-			off = next
-			if !filter || e.Sequence > afterSeq {
-				out = append(out, e)
-			}
+// EntriesContaining returns the entries needed to replay from record sequence
+// seq onward: every entry whose range end is > seq, in order. The first entry
+// returned is the one whose range contains seq (or, if seq is below all live
+// entries, the earliest entry); a consumer skips records before seq in that
+// first segment. This is the record-addressable read path.
+func (m *Manifest) EntriesContaining(seq uint64) ([]Entry, error) {
+	all, err := m.Entries()
+	if err != nil {
+		return nil, err
+	}
+	out := all[:0:0]
+	for _, e := range all {
+		if e.End() > seq {
+			out = append(out, e)
 		}
 	}
 	return out, nil
 }
 
-// TruncateThrough removes all entries with Sequence <= throughSeq from the
-// front of the manifest. It is the manifest-side companion to a snapshot: once
-// a snapshot covers up to throughSeq, those entries are redundant (a replica
-// bootstraps from the snapshot instead), and their segment objects become
-// eligible for retention GC. Returns the number of entries removed.
-//
-// Truncation is rare (snapshot cadence), so this re-encodes the survivors
-// rather than slicing; correctness over micro-optimization.
+// Locate returns the entry whose record-sequence range contains seq, along with
+// the index of that record within the segment (seq - entry.Sequence) and a
+// found flag. A consumer reads only the manifest, calls Locate(seq) to learn
+// which segment to fetch and how many leading records to skip, then streams
+// forward. For a legacy (Count==0) entry the offset is always 0. Not found if
+// seq is outside [firstLiveSequence, NextSequence).
+func (m *Manifest) Locate(seq uint64) (Entry, int, bool) {
+	all, err := m.Entries()
+	if err != nil {
+		return Entry{}, 0, false
+	}
+	// Entries are sorted and contiguous; binary search on Sequence.
+	lo, hi := 0, len(all)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if all[mid].End() <= seq {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < len(all) && all[lo].Contains(seq) {
+		return all[lo], int(seq - all[lo].Sequence), true
+	}
+	return Entry{}, 0, false
+}
+
+// TruncateThrough removes every entry whose records are all <= throughSeq (its
+// End()-1 <= throughSeq), i.e. entries fully superseded by a snapshot covering
+// up to throughSeq. An entry with any record > throughSeq is kept whole (a
+// segment is never split). Returns the number of entries removed.
 func (m *Manifest) TruncateThrough(throughSeq uint64) (int, error) {
 	all, err := m.Entries()
 	if err != nil {
@@ -278,7 +376,7 @@ func (m *Manifest) TruncateThrough(throughSeq uint64) (int, error) {
 	kept := all[:0:0]
 	removed := 0
 	for _, e := range all {
-		if e.Sequence <= throughSeq {
+		if e.End()-1 <= throughSeq {
 			removed++
 			continue
 		}
@@ -312,12 +410,13 @@ func encodeEntry(buf []byte, e Entry) ([]byte, error) {
 	if len(e.Location) > math.MaxUint16 {
 		return nil, fmt.Errorf("wal: location length %d exceeds u16 max", len(e.Location))
 	}
-	bodyLen := sequenceSize + locationLenSize + len(e.Location) + metadataSize
+	bodyLen := sequenceSize + countFieldSize + locationLenSize + len(e.Location) + metadataSize
 	if bodyLen > math.MaxUint32 {
 		return nil, fmt.Errorf("wal: entry body length %d exceeds u32 max", bodyLen)
 	}
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(bodyLen))
 	buf = binary.LittleEndian.AppendUint64(buf, e.Sequence)
+	buf = binary.LittleEndian.AppendUint32(buf, e.Count)
 	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(e.Location)))
 	buf = append(buf, e.Location...)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(e.Metadata)))
@@ -330,7 +429,9 @@ func encodeEntry(buf []byte, e Entry) ([]byte, error) {
 	return buf, nil
 }
 
-func decodeEntry(data []byte, offset int) (Entry, int, error) {
+// decodeEntry decodes one entry. hasCount selects the v3 encoding (with the
+// Count field) vs the legacy encoding (no Count, yielding Count==0).
+func decodeEntry(data []byte, offset int, hasCount bool) (Entry, int, error) {
 	fail := func(msg string) (Entry, int, error) {
 		return Entry{}, 0, fmt.Errorf("wal: %s", msg)
 	}
@@ -340,11 +441,20 @@ func decodeEntry(data []byte, offset int) (Entry, int, error) {
 	bodyLen := int(binary.LittleEndian.Uint32(data[offset : offset+entryBodyLenSize]))
 	off := offset + entryBodyLenSize
 	end := off + bodyLen
-	if bodyLen < sequenceSize+locationLenSize+metadataCountSize || end > len(data) {
+	minBody := sequenceSize + locationLenSize + metadataCountSize
+	if hasCount {
+		minBody += countFieldSize
+	}
+	if bodyLen < minBody || end > len(data) {
 		return fail("entry body overruns manifest")
 	}
 	seq := binary.LittleEndian.Uint64(data[off : off+sequenceSize])
 	off += sequenceSize
+	var cnt uint32
+	if hasCount {
+		cnt = binary.LittleEndian.Uint32(data[off : off+countFieldSize])
+		off += countFieldSize
+	}
 	locLen := int(binary.LittleEndian.Uint16(data[off : off+locationLenSize]))
 	off += locationLenSize
 	if off+locLen > end {
@@ -382,5 +492,5 @@ func decodeEntry(data []byte, offset int) (Entry, int, error) {
 	if off != end {
 		return fail("entry body has trailing bytes")
 	}
-	return Entry{Sequence: seq, Location: location, Metadata: md}, end, nil
+	return Entry{Sequence: seq, Count: cnt, Location: location, Metadata: md}, end, nil
 }
