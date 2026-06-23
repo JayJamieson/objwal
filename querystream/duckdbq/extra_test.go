@@ -74,7 +74,7 @@ func TestDedup(t *testing.T) {
 
 // TestPruningFiresOnSeqBucket asserts (via EXPLAIN ANALYZE through the real
 // bound view) that a tight seq window scans a single partition file, not all of
-// them — the seq_bucket lower bound the query layer injects is what enables it.
+// them - the seq_bucket lower bound the query layer injects is what enables it.
 func TestPruningFiresOnSeqBucket(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

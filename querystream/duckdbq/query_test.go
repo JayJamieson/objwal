@@ -147,7 +147,8 @@ func TestIncremental(t *testing.T) {
 	writeFixtures(t, dir, 10, []uint64{0, 1, 2, 3, 4, 5, 6, 7})
 	e := openLocal(t, dir, 10)
 
-	// First pass from wm=0 exclusive: returns seq in (0,7] = 1..7.
+	// First pass from wm=0 ("nothing read yet"): no lower bound, so the full set
+	// 0..7 is returned including the 0-based first record.
 	rows, high, err := e.Query(ctx, Query{SQL: "SELECT seq, val FROM records ORDER BY seq", Mode: Incremental}, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -156,12 +157,12 @@ func TestIncremental(t *testing.T) {
 	if high != 7 {
 		t.Fatalf("newHigh = %d, want 7", high)
 	}
-	if len(got) != 7 || got[0].Seq != 1 || got[len(got)-1].Seq != 7 {
-		t.Fatalf("incremental from 0 got %d rows [%d..]", len(got), got[0].Seq)
+	if len(got) != 8 || got[0].Seq != 0 || got[len(got)-1].Seq != 7 {
+		t.Fatalf("incremental from 0 got %d rows [%d..%d], want 8 [0..7]", len(got), got[0].Seq, got[len(got)-1].Seq)
 	}
 
-	// Second pass from the advanced watermark: no new data => zero rows, high unchanged.
-	rows, high2, err := e.Query(ctx, Query{SQL: "SELECT seq, val FROM records ORDER BY seq", Mode: Incremental}, high)
+	// Resume from the next-to-read watermark (high+1): no new data => zero rows.
+	rows, high2, err := e.Query(ctx, Query{SQL: "SELECT seq, val FROM records ORDER BY seq", Mode: Incremental}, high+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,9 +174,9 @@ func TestIncremental(t *testing.T) {
 		t.Fatalf("newHigh stayed %d, want 7", high2)
 	}
 
-	// Append more data, then incremental from wm=7 returns only the tail.
+	// Append more data, then resume from high2+1 (= 8) returns only the tail.
 	writeFixtures(t, dir, 10, []uint64{8, 9, 10, 11})
-	rows, high3, err := e.Query(ctx, Query{SQL: "SELECT seq, val FROM records ORDER BY seq", Mode: Incremental}, high2)
+	rows, high3, err := e.Query(ctx, Query{SQL: "SELECT seq, val FROM records ORDER BY seq", Mode: Incremental}, high2+1)
 	if err != nil {
 		t.Fatal(err)
 	}

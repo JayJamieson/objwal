@@ -17,7 +17,7 @@
 //
 // Legacy footers (v1 buffer, v2) used one sequence per entry; their entries are
 // read back with Count==0, meaning "this segment occupies a single sequence
-// slot and all its records share that sequence" — the original whole-segment
+// slot and all its records share that sequence" - the original whole-segment
 // semantics, preserved so old manifests still replay correctly.
 package wal
 

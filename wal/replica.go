@@ -28,6 +28,13 @@ type ReplicaConfig struct {
 	// default). Larger values trade a few extra re-applied segments after a
 	// crash (idempotent) for fewer fsyncs.
 	CursorSaveInterval int
+	// MaxRecordsPerPoll bounds how many records a single Poll applies: once a
+	// poll has applied at least this many, it stops at the next segment boundary
+	// (cursor saved there) and returns, leaving the rest for the following Poll.
+	// 0 means unbounded (drain everything available). Granularity is a whole
+	// segment, so the effective cap is "the first segment boundary at or past
+	// this count". Useful for pacing ingestion so progress is observable.
+	MaxRecordsPerPoll int
 }
 
 func (c *ReplicaConfig) withDefaults() {
@@ -139,6 +146,11 @@ func (r *Replica) Poll(ctx context.Context) (int, error) {
 			if err := saveCursor(); err != nil {
 				return applied, err
 			}
+		}
+		// Pace ingestion: stop at this segment boundary once the per-poll budget
+		// is met. The trailing saveCursor below persists r.next = e.End().
+		if r.cfg.MaxRecordsPerPoll > 0 && applied >= r.cfg.MaxRecordsPerPoll {
+			break
 		}
 	}
 	// Always persist the final position at the end of a poll that advanced.

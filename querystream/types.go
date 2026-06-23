@@ -86,6 +86,11 @@ type Config struct {
 
 	// PollInterval is how often Run polls the WAL for new records (default 1s).
 	PollInterval time.Duration
+
+	// MaxRecordsPerPoll bounds how many WAL records one Poll ingests, stopping at
+	// the next segment boundary once met (0 = unbounded). Paces ingestion so a
+	// pre-loaded WAL materializes gradually across polls rather than all at once.
+	MaxRecordsPerPoll int
 }
 
 func (c *Config) withDefaults() {

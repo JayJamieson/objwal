@@ -52,7 +52,7 @@
 # BENCH_CONCURRENCY maximize aggregate throughput by amortizing the per-segment
 # and per-manifest-CAS round trips; small flush thresholds and low concurrency
 # minimize commit latency per record. See the EXAMPLES section at the bottom.
-# Against real S3 raise BENCH_CONCURRENCY (e.g. 128) — per-request latency
+# Against real S3 raise BENCH_CONCURRENCY (e.g. 128) - per-request latency
 # dominates, so a low value badly understates achievable aggregate throughput.
 
 set -euo pipefail

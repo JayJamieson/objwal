@@ -8,13 +8,15 @@ import (
 )
 
 // Query resolves the [lo,hi] sequence window for q.Mode, defines the bounded
-// view, and runs q.SQL against it. It returns the result rows and newHigh (the
-// window's upper bound = current visibleHigh); for Incremental, persist newHigh
-// as the next watermark after consuming the rows.
+// view, and runs q.SQL against it. It returns the result rows and hi (the
+// current visibleHigh, i.e. the highest sequence in the window).
 //
-// wm is the prior Incremental watermark (the exclusive lower bound); it is
-// ignored for Cumulative, which uses q.Start. Returns ErrNoData when the read
-// location holds no finalized files.
+// wm is the Incremental watermark: the next record sequence to read (half-open,
+// inclusive lower bound), matching the replica cursor convention. A wm of 0
+// means "nothing read yet" and reads from the first record. It is ignored for
+// Cumulative, which uses q.Start as its inclusive lower bound. To resume an
+// Incremental read after consuming this batch, pass hi+1 as the next wm. Returns
+// ErrNoData when the read location holds no finalized files.
 func (e *Engine) Query(ctx context.Context, q Query, wm uint64) (*sql.Rows, uint64, error) {
 	hi, have, err := e.VisibleHigh(ctx)
 	if err != nil {
@@ -24,8 +26,8 @@ func (e *Engine) Query(ctx context.Context, q Query, wm uint64) (*sql.Rows, uint
 		return nil, 0, ErrNoData
 	}
 
-	loExcl, hasLo, bucketLo := resolveWindow(q, wm, e.cfg.BucketSize)
-	view := e.buildViewSQL(loExcl, hasLo, hi, bucketLo)
+	loIncl, hasLo, bucketLo := resolveWindow(q, wm, e.cfg.BucketSize)
+	view := e.buildViewSQL(loIncl, hasLo, hi, bucketLo)
 	if _, err := e.db.ExecContext(ctx, view); err != nil {
 		return nil, 0, fmt.Errorf("duckdbq: build view: %w", err)
 	}
@@ -36,31 +38,31 @@ func (e *Engine) Query(ctx context.Context, q Query, wm uint64) (*sql.Rows, uint
 	return rows, hi, nil
 }
 
-// resolveWindow maps (mode, watermark, Start) to an exclusive lower bound and
-// the seq_bucket lower bound for partition pruning. Cumulative with Start==0 has
-// no lower bound (full scan, no bucket predicate so flat layouts also work).
-func resolveWindow(q Query, wm, bucketSize uint64) (loExcl uint64, hasLo bool, bucketLo uint64) {
-	switch q.Mode {
-	case Incremental:
-		return wm, true, wm / bucketSize
-	default: // Cumulative
-		if q.Start == 0 {
-			return 0, false, 0
-		}
-		loExcl = q.Start - 1
-		return loExcl, true, loExcl / bucketSize
+// resolveWindow maps (mode, watermark, Start) to an inclusive lower bound and
+// the seq_bucket lower bound for partition pruning. Both modes take an inclusive
+// lower bound: the Incremental watermark (next-to-read) or Cumulative q.Start. A
+// zero lower bound means "from the beginning" and yields no predicate at all - a
+// full scan with no bucket bound, so seq 0 is read and flat layouts also work.
+func resolveWindow(q Query, wm uint64, bucketSize uint64) (loIncl uint64, hasLo bool, bucketLo uint64) {
+	lo := wm
+	if q.Mode == Cumulative {
+		lo = q.Start
 	}
+	if lo == 0 {
+		return 0, false, 0
+	}
+	return lo, true, lo / bucketSize
 }
 
 // buildViewSQL renders the CREATE OR REPLACE TEMP VIEW statement that bounds the
-// read to (loExcl, hi] (or [.., hi] when !hasLo), injects the seq_bucket lower
+// read to [loIncl, hi] (or [.., hi] when !hasLo), injects the seq_bucket lower
 // bound for file-level pruning, and optionally dedups by the seq column.
-func (e *Engine) buildViewSQL(loExcl uint64, hasLo bool, hi, bucketLo uint64) string {
+func (e *Engine) buildViewSQL(loIncl uint64, hasLo bool, hi, bucketLo uint64) string {
 	seq := e.cfg.SeqColumn
 	var where strings.Builder
 	fmt.Fprintf(&where, "%s <= %d", seq, hi)
 	if hasLo {
-		fmt.Fprintf(&where, " AND %s > %d", seq, loExcl)
+		fmt.Fprintf(&where, " AND %s >= %d", seq, loIncl)
 		// seq_bucket is the sink's hive partition column; bounding it lets DuckDB
 		// prune whole partitions it would not derive from a seq predicate alone.
 		fmt.Fprintf(&where, " AND seq_bucket >= %d", bucketLo)

@@ -149,7 +149,7 @@ func TestReplicaResumesMidSegment(t *testing.T) {
 }
 
 // A legacy (Count==0) entry occupies a single sequence slot and applies all its
-// records at that one sequence — the pre-v3 whole-segment semantics — and a
+// records at that one sequence - the pre-v3 whole-segment semantics - and a
 // later native (per-record) entry continues contiguously after it.
 func TestLegacyEntryWholeSegmentSemantics(t *testing.T) {
 	m := NewManifest()

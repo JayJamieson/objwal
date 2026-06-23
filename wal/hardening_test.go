@@ -213,6 +213,43 @@ func TestReplicaResumesFromPersistedCursor(t *testing.T) {
 	}
 }
 
+// TestReplicaMaxRecordsPerPoll bounds ingestion: each Poll applies at most the
+// configured budget, stopping at a segment boundary and resuming on the next
+// Poll, so a fully-committed WAL is drained gradually across polls.
+func TestReplicaMaxRecordsPerPoll(t *testing.T) {
+	ctx := context.Background()
+	os := objectstore.NewInMemory()
+	p := newProducer(t, os)
+	// Five single-record segments => sequences 0..4.
+	for _, w := range []string{"s0", "s1", "s2", "s3", "s4"} {
+		d, _ := p.Append(ctx, [][]byte{[]byte(w)}, nil)
+		if _, err := d.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.Close(ctx)
+
+	app := &recordingApplier{}
+	r := NewReplica(os, app, ReplicaConfig{ManifestPath: testManifest, MaxRecordsPerPoll: 2})
+
+	// Budget 2 over 1-record segments: 2, 2, 1, then 0.
+	for _, want := range []struct{ applied, next int }{{2, 2}, {2, 4}, {1, 5}, {0, 5}} {
+		n, err := r.Poll(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != want.applied {
+			t.Fatalf("poll applied %d, want %d", n, want.applied)
+		}
+		if r.Next() != uint64(want.next) {
+			t.Fatalf("after poll Next() = %d, want %d", r.Next(), want.next)
+		}
+	}
+	if got := app.datas(); len(got) != 5 || got[0] != "s0" || got[4] != "s4" {
+		t.Fatalf("applied %v, want [s0..s4] in order", got)
+	}
+}
+
 // --- Upload retry / backoff ---
 
 // flakyStore wraps an ObjectStore and fails the first failPuts unconditional
