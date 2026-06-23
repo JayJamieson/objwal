@@ -31,6 +31,11 @@ type Sink[T any] struct {
 	catalog     []FileInfo
 
 	nextCursor uint64 // next sequence to read; == lastFlushed+1
+
+	// notify is a coalescing wakeup: flushOne signals the new visibleHigh after
+	// each watermark advance. Single-slot, drop-on-full, so ingest never blocks
+	// on an absent or slow consumer. See Notify.
+	notify chan uint64
 }
 
 type rowItem[T any] struct {
@@ -57,7 +62,7 @@ func NewSink[T any](cfg Config, decode Decoder[T], enc Encoder[T]) (*Sink[T], er
 		return nil, fmt.Errorf("querystream: create dir: %w", err)
 	}
 
-	s := &Sink[T]{cfg: cfg, decode: decode, enc: enc}
+	s := &Sink[T]{cfg: cfg, decode: decode, enc: enc, notify: make(chan uint64, 1)}
 
 	// Resume point: persisted cursor wins over StartAt.
 	start := cfg.StartAt
@@ -75,8 +80,9 @@ func NewSink[T any](cfg Config, decode Decoder[T], enc Encoder[T]) (*Sink[T], er
 	}
 
 	s.replica = wal.NewReplica(cfg.ObjectStore, wal.ApplyFunc(s.onRecord), wal.ReplicaConfig{
-		ManifestPath: cfg.ManifestPath,
-		StartAt:      start,
+		ManifestPath:      cfg.ManifestPath,
+		StartAt:           start,
+		MaxRecordsPerPoll: cfg.MaxRecordsPerPoll,
 		// No CursorStore on the replica: the sink advances the cursor itself,
 		// only after rows are durable in a finalized file.
 	})
@@ -189,6 +195,13 @@ func (s *Sink[T]) flushOne(ctx context.Context) (bool, error) {
 	s.mu.Unlock()
 	s.nextCursor = last + 1
 
+	// Coalescing, non-blocking wakeup: a full slot already carries "there's new
+	// data", and the value is only a hint (consumers read VisibleHigh for truth).
+	select {
+	case s.notify <- last:
+	default:
+	}
+
 	if s.cfg.Cursor != nil {
 		if err := s.cfg.Cursor.Save(ctx, s.nextCursor); err != nil {
 			return false, fmt.Errorf("querystream: save cursor: %w", err)
@@ -226,6 +239,15 @@ func (s *Sink[T]) VisibleHigh() (uint64, bool) {
 	defer s.mu.RUnlock()
 	return s.visibleHigh, s.haveData
 }
+
+// Notify returns a coalescing channel that receives the new visibleHigh each
+// time a flush advances the watermark. It is single-slot and drop-on-full: a
+// slow or absent consumer never blocks ingest, and a missed (coalesced) tick is
+// harmless because the value is only a wakeup - read VisibleHigh for the truth.
+// Pass it to duckdbq.StreamConfig.Notify to drive a continuous in-process query
+// loop. The channel is not closed; stop the consuming Stream by cancelling its
+// context.
+func (s *Sink[T]) Notify() <-chan uint64 { return s.notify }
 
 // Catalog returns a snapshot of the finalized files and their sequence ranges.
 func (s *Sink[T]) Catalog() []FileInfo {

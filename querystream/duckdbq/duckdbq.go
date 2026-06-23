@@ -29,9 +29,10 @@ import (
 type Mode int
 
 const (
-	// Incremental returns only rows newer than the supplied watermark:
-	// queryWatermark < seq <= visibleHigh. The watermark advances to the
-	// returned high after a successful emit.
+	// Incremental returns rows from the supplied watermark through visibleHigh:
+	// queryWatermark <= seq <= visibleHigh. The watermark is the next sequence to
+	// read (half-open, like the replica cursor): 0 means "nothing read yet" and
+	// reads from the first record; it advances to visibleHigh+1 after an emit.
 	Incremental Mode = iota
 	// Cumulative returns every row from Query.Start through visibleHigh,
 	// re-scanning on each call: Start <= seq <= visibleHigh.

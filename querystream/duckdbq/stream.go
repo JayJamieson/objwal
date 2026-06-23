@@ -124,13 +124,16 @@ func streamTrigger[T any](ctx context.Context, e *Engine, cfg StreamConfig[T], p
 			return err
 		}
 		prev = v
-		if hi <= prev {
+		// prev is the next-to-read sequence (half-open). Nothing new once it has
+		// passed the visible high. A fresh prev==0 always proceeds, so seq 0 is
+		// read rather than skipped.
+		if prev > hi {
 			return nil // no new records
 		}
 	}
 
-	loExcl, hasLo, bucketLo := resolveWindow(cfg.Query, prev, e.cfg.BucketSize)
-	if _, err := e.db.ExecContext(ctx, e.buildViewSQL(loExcl, hasLo, hi, bucketLo)); err != nil {
+	loIncl, hasLo, bucketLo := resolveWindow(cfg.Query, prev, e.cfg.BucketSize)
+	if _, err := e.db.ExecContext(ctx, e.buildViewSQL(loIncl, hasLo, hi, bucketLo)); err != nil {
 		return fmt.Errorf("duckdbq: stream build view: %w", err)
 	}
 	rows, err := e.db.QueryContext(ctx, cfg.Query.SQL)
@@ -166,10 +169,11 @@ func streamTrigger[T any](ctx context.Context, e *Engine, cfg StreamConfig[T], p
 	rows.Close()
 
 	// The stream owns watermark advancement (Incremental): commit before
-	// delivering. This is at-most-once to the consumer across a crash; an
-	// at-least-once variant would advance after the consumer acks via Recycle.
+	// delivering. The watermark is next-to-read, so it advances to hi+1. This is
+	// at-most-once to the consumer across a crash; an at-least-once variant would
+	// advance after the consumer acks via Recycle.
 	if cfg.Query.Mode == Incremental {
-		if err := cfg.Watermark.SaveCAS(ctx, prev, hi); err != nil {
+		if err := cfg.Watermark.SaveCAS(ctx, prev, hi+1); err != nil {
 			pool.Put(buf[:0])
 			return err
 		}

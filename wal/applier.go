@@ -52,7 +52,7 @@ type HandleFunc[T any] func(ctx context.Context, seq uint64, op T) error
 // TypedApplier is the recommended way to plug an engine in: supply a decoder
 // that turns record bytes into your operation type and a handler that applies
 // it. The wal layer owns the boilerplate (pull the record, decode, dispatch)
-// and stays ignorant of both the frame format and the engine — neither the
+// and stays ignorant of both the frame format and the engine - neither the
 // decode nor the apply logic lives in this package.
 //
 //	applier := wal.TypedApplier(

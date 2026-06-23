@@ -29,7 +29,7 @@ func manifestFromCounts(counts []int) (*Manifest, uint64) {
 }
 
 // INVARIANT: entries tile the record-sequence space [0, NextSequence)
-// contiguously — no gaps, no overlaps — and NextSequence == sum of counts.
+// contiguously - no gaps, no overlaps - and NextSequence == sum of counts.
 func TestProp_RangesPartitionContiguously(t *testing.T) {
 	f := func(raw []uint16) bool {
 		counts := clampCounts(raw)
@@ -55,9 +55,9 @@ func TestProp_RangesPartitionContiguously(t *testing.T) {
 	}
 }
 
-// INVARIANT: Locate is total over [0, NextSequence) — every record sequence
+// INVARIANT: Locate is total over [0, NextSequence) - every record sequence
 // resolves to the unique entry containing it with the correct within-segment
-// offset — and returns not-found at or beyond NextSequence.
+// offset - and returns not-found at or beyond NextSequence.
 func TestProp_LocateIsTotalAndExact(t *testing.T) {
 	f := func(raw []uint16, beyond uint16) bool {
 		counts := clampCounts(raw)
@@ -222,7 +222,7 @@ func TestProp_TruncatePreservesContiguityAndLiveness(t *testing.T) {
 
 // INVARIANT (end to end): replaying from ANY record sequence X yields exactly
 // the records with sequence >= X, in order, with contiguous sequences X, X+1,
-// ... — across segment rotation and resuming mid-segment. This ties producer
+// ... - across segment rotation and resuming mid-segment. This ties producer
 // (counts, coalescing, rotation) to manifest (ranges) to replica (per-record
 // sequencing, mid-segment skip).
 func TestProp_ReplayFromAnyPointMatches(t *testing.T) {

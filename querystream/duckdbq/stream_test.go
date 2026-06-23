@@ -38,21 +38,23 @@ func TestStreamIncrementalAdvancesWatermark(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Trigger 1: from wm=0 exclusive => seq 1..9.
+	// Trigger 1: from an unset watermark => no lower bound => seq 0..9 (the
+	// 0-based first record is included, not skipped).
 	notify <- 9
 	res := <-out
 	if res.High != 9 {
 		t.Fatalf("res.High = %d, want 9", res.High)
 	}
-	if len(res.Rows) != 9 || res.Rows[0].Seq != 1 || res.Rows[8].Seq != 9 {
-		t.Fatalf("trigger1 rows = %d [%d..], want 9 starting at 1", len(res.Rows), res.Rows[0].Seq)
+	if len(res.Rows) != 10 || res.Rows[0].Seq != 0 || res.Rows[9].Seq != 9 {
+		t.Fatalf("trigger1 rows = %d [%d..], want 10 starting at 0", len(res.Rows), res.Rows[0].Seq)
 	}
-	if res.Rows[0].Val != "v1" {
-		t.Fatalf("trigger1 val = %q, want v1", res.Rows[0].Val)
+	if res.Rows[0].Val != "v0" {
+		t.Fatalf("trigger1 val = %q, want v0", res.Rows[0].Val)
 	}
-	// Stream owns advancement: the watermark is committed by the time we receive.
-	if v, _, _ := wm.Load(ctx); v != 9 {
-		t.Fatalf("watermark = %d, want 9", v)
+	// Stream owns advancement: the watermark (next-to-read) is committed to hi+1
+	// by the time we receive.
+	if v, _, _ := wm.Load(ctx); v != 10 {
+		t.Fatalf("watermark = %d, want 10", v)
 	}
 
 	// Decoupling proof: the result is materialized (no live *sql.Rows), so the
@@ -66,15 +68,15 @@ func TestStreamIncrementalAdvancesWatermark(t *testing.T) {
 	rows.Close()
 	res.Recycle()
 
-	// Trigger 2: append more, from wm=9 => seq 10..14.
+	// Trigger 2: append more, from wm=10 (next-to-read) => seq 10..14.
 	writeFixtures(t, dir, 10, []uint64{10, 11, 12, 13, 14})
 	notify <- 14
 	res2 := <-out
 	if res2.High != 14 || len(res2.Rows) != 5 || res2.Rows[0].Seq != 10 || res2.Rows[4].Seq != 14 {
 		t.Fatalf("trigger2 rows = %d high %d [%d..], want 5 high 14 starting 10", len(res2.Rows), res2.High, res2.Rows[0].Seq)
 	}
-	if v, _, _ := wm.Load(ctx); v != 14 {
-		t.Fatalf("watermark after trigger2 = %d, want 14", v)
+	if v, _, _ := wm.Load(ctx); v != 15 {
+		t.Fatalf("watermark after trigger2 = %d, want 15", v)
 	}
 	res2.Recycle()
 

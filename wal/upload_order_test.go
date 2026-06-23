@@ -138,7 +138,7 @@ func TestParallelUploadsCommitInOrderDespiteReorderedCompletion(t *testing.T) {
 			t.Fatalf("durability %d: %v", i, err)
 		}
 		if seq != uint64(i) {
-			t.Fatalf("record %d (%q) got sequence %d, want %d — ordering violated", i, want[i], seq, i)
+			t.Fatalf("record %d (%q) got sequence %d, want %d - ordering violated", i, want[i], seq, i)
 		}
 	}
 
@@ -212,7 +212,7 @@ func TestUploadFailureHaltsAndPreservesPrefix(t *testing.T) {
 		t.Fatal("producer should be halted after an upload failure")
 	}
 
-	// The replica sees ONLY the committed prefix — never "drop".
+	// The replica sees ONLY the committed prefix - never "drop".
 	app := &recordingApplier{}
 	rep := NewReplica(fs, app, ReplicaConfig{ManifestPath: testManifest})
 	if _, err := rep.Poll(ctx); err != nil {
@@ -251,7 +251,7 @@ func TestManifestObjectExistsAfterProduce(t *testing.T) {
 	_ = p.Close(ctx)
 
 	// Exactly one manifest object exists, even after the epoch claim plus
-	// several commits — it is updated in place, not appended to.
+	// several commits - it is updated in place, not appended to.
 	manifests, err := mem.List(ctx, "wal/manifest")
 	if err != nil {
 		t.Fatal(err)

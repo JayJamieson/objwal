@@ -42,13 +42,13 @@ type ProducerConfig struct {
 	Compression Compression
 
 	// MaxInFlightBytes caps the total bytes Appended but not yet durably
-	// committed. Append BLOCKS once a further record would exceed it — the
+	// committed. Append BLOCKS once a further record would exceed it - the
 	// primary backpressure signal (default 256 MiB). A single Append larger
 	// than the cap is admitted only when nothing else is in flight, to avoid
 	// deadlock.
 	MaxInFlightBytes int
 	// MaxInFlightBatches caps the number of un-committed Append calls in
-	// flight — a secondary safety stop against many tiny Appends (default
+	// flight - a secondary safety stop against many tiny Appends (default
 	// 4096).
 	MaxInFlightBatches int
 
@@ -294,7 +294,7 @@ func (p *Producer) claim(ctx context.Context) error {
 
 // Append enqueues a group of framed records with an optional metadata payload.
 // It BLOCKS when the in-flight byte (or batch-count) budget is exhausted, until
-// a flush frees space or ctx is cancelled — this is the producer's backpressure
+// a flush frees space or ctx is cancelled - this is the producer's backpressure
 // onto the caller. The returned Durability resolves when the group is
 // committed. Records are not copied; do not mutate them until it resolves.
 func (p *Producer) Append(ctx context.Context, records [][]byte, meta []byte) (*Durability, error) {
@@ -380,7 +380,7 @@ func (p *Producer) run() {
 }
 
 // flush drains buffered records, rotates them into size-capped segments,
-// uploads each, and CAS-appends their entries — coalescing up to
+// uploads each, and CAS-appends their entries - coalescing up to
 // ManifestAppendBatchSize entries per commit. In-flight budget for an Append is
 // released only once its segment is resolved (committed or failed).
 func (p *Producer) flush(ctx context.Context) error {
@@ -593,7 +593,7 @@ func (p *Producer) release(bytes, count int) {
 
 // resolvePlan resolves each Append in a committed segment to the sequence of
 // its own first record (baseSeq + the group's StartIndex within the segment),
-// not the segment base — so a caller that coalesced behind others still learns
+// not the segment base - so a caller that coalesced behind others still learns
 // where its records actually landed in the sequence space.
 func (p *Producer) resolvePlan(pl segPlan, baseSeq uint64) {
 	var b, c int
