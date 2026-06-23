@@ -36,6 +36,7 @@ sequenceDiagram
 
     Note over SK,Q: Separate process · read-only on the WAL · many may tail concurrently
 
+    rect rgb(235, 245, 255)
     loop every poll-interval (consumer tick)
         SK->>S3: GET manifest (current entries)
         S3-->>SK: entries past the local cursor
@@ -55,7 +56,8 @@ sequenceDiagram
         Q->>FS: read_parquet(window) - seq_bucket pruning + optional dedup
         FS-->>Q: rows
         Q-->>Con: render result (table refresh)
-        Note over Q: incremental: advance watermark to hi+1<br/>(half-open next-to-read; 0 = nothing read)
+        Note over Q: incremental: advance watermark to hi+1<br/>(half-open next-to-read 0 = nothing read)
+    end
     end
 ```
 
