@@ -42,13 +42,13 @@ type ProducerConfig struct {
 	Compression Compression
 
 	// MaxInFlightBytes caps the total bytes Appended but not yet durably
-	// committed. Append BLOCKS once a further record would exceed it — the
+	// committed. Append BLOCKS once a further record would exceed it - the
 	// primary backpressure signal (default 256 MiB). A single Append larger
 	// than the cap is admitted only when nothing else is in flight, to avoid
 	// deadlock.
 	MaxInFlightBytes int
 	// MaxInFlightBatches caps the number of un-committed Append calls in
-	// flight — a secondary safety stop against many tiny Appends (default
+	// flight - a secondary safety stop against many tiny Appends (default
 	// 4096).
 	MaxInFlightBatches int
 
@@ -119,10 +119,11 @@ func (c *ProducerConfig) withDefaults() {
 type Durability struct {
 	done chan struct{}
 	seq  uint64
+	n    int
 	err  error
 }
 
-func newDurability() *Durability { return &Durability{done: make(chan struct{})} }
+func newDurability(n int) *Durability { return &Durability{done: make(chan struct{}), n: n} }
 
 func (d *Durability) resolve(seq uint64, err error) {
 	d.seq, d.err = seq, err
@@ -138,6 +139,59 @@ func (d *Durability) Wait(ctx context.Context) (uint64, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
+}
+
+// Count is the number of records this Append wrote. They occupy the contiguous
+// record-sequence range [first, first+Count), where first is what Wait returns.
+func (d *Durability) Count() int { return d.n }
+
+// WaitRange blocks like Wait and returns the full record-sequence range this
+// Append occupies, so callers never hand-roll first+i arithmetic. This is the
+// preferred accessor for a multi-record Append.
+func (d *Durability) WaitRange(ctx context.Context) (SeqRange, error) {
+	first, err := d.Wait(ctx)
+	if err != nil {
+		return SeqRange{}, err
+	}
+	return SeqRange{First: first, Count: d.n}, nil
+}
+
+// SeqRange is the contiguous record-sequence range a single Append occupies:
+// its records have sequences [First, First+Count). Use it instead of
+// recomputing First+i offsets at call sites, which is an easy place to
+// introduce off-by-one errors.
+type SeqRange struct {
+	First uint64
+	Count int
+}
+
+// End is the exclusive upper bound of the range (First+Count).
+func (r SeqRange) End() uint64 { return r.First + uint64(r.Count) }
+
+// Last is the sequence of the final record (First+Count-1); only meaningful
+// when Count >= 1.
+func (r SeqRange) Last() uint64 { return r.First + uint64(r.Count) - 1 }
+
+// At returns the sequence of the i-th record in the Append (0-indexed). It
+// panics if i is outside [0, Count).
+func (r SeqRange) At(i int) uint64 {
+	if i < 0 || i >= r.Count {
+		panic(fmt.Sprintf("wal: SeqRange.At(%d) out of range [0,%d)", i, r.Count))
+	}
+	return r.First + uint64(i)
+}
+
+// Contains reports whether seq is one of this Append's record sequences.
+func (r SeqRange) Contains(seq uint64) bool { return seq >= r.First && seq < r.End() }
+
+// All materializes every sequence in the range. Prefer First/Count/At for large
+// batches; this allocates a slice.
+func (r SeqRange) All() []uint64 {
+	out := make([]uint64, r.Count)
+	for i := range out {
+		out[i] = r.First + uint64(i)
+	}
+	return out
 }
 
 type pendingItem struct {
@@ -240,11 +294,11 @@ func (p *Producer) claim(ctx context.Context) error {
 
 // Append enqueues a group of framed records with an optional metadata payload.
 // It BLOCKS when the in-flight byte (or batch-count) budget is exhausted, until
-// a flush frees space or ctx is cancelled — this is the producer's backpressure
+// a flush frees space or ctx is cancelled - this is the producer's backpressure
 // onto the caller. The returned Durability resolves when the group is
 // committed. Records are not copied; do not mutate them until it resolves.
 func (p *Producer) Append(ctx context.Context, records [][]byte, meta []byte) (*Durability, error) {
-	w := newDurability()
+	w := newDurability(len(records))
 	b := 0
 	for _, r := range records {
 		b += len(r)
@@ -326,7 +380,7 @@ func (p *Producer) run() {
 }
 
 // flush drains buffered records, rotates them into size-capped segments,
-// uploads each, and CAS-appends their entries — coalescing up to
+// uploads each, and CAS-appends their entries - coalescing up to
 // ManifestAppendBatchSize entries per commit. In-flight budget for an Append is
 // released only once its segment is resolved (committed or failed).
 func (p *Producer) flush(ctx context.Context) error {
@@ -436,7 +490,7 @@ func (p *Producer) commitInOrder(ctx context.Context, plans []segPlan) (int, err
 			return i, err
 		}
 		for gi, pl := range group {
-			p.resolveItems(pl.items, seqs[gi])
+			p.resolvePlan(pl, seqs[gi])
 		}
 		i = end
 	}
@@ -495,7 +549,7 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		}
 		seqs := make([]uint64, len(plans))
 		for i, pl := range plans {
-			s, e := m.Append(pl.location, pl.metas)
+			s, e := m.Append(pl.location, pl.metas, len(pl.records))
 			if e != nil {
 				return nil, e // encoding error: not retryable
 			}
@@ -535,6 +589,24 @@ func (p *Producer) release(bytes, count int) {
 	if room {
 		p.signal(p.released)
 	}
+}
+
+// resolvePlan resolves each Append in a committed segment to the sequence of
+// its own first record (baseSeq + the group's StartIndex within the segment),
+// not the segment base - so a caller that coalesced behind others still learns
+// where its records actually landed in the sequence space.
+func (p *Producer) resolvePlan(pl segPlan, baseSeq uint64) {
+	var b, c int
+	for k, it := range pl.items {
+		recSeq := baseSeq
+		if k < len(pl.metas) {
+			recSeq = baseSeq + uint64(pl.metas[k].StartIndex)
+		}
+		it.w.resolve(recSeq, nil)
+		b += it.bytes
+		c++
+	}
+	p.release(b, c)
 }
 
 func (p *Producer) resolveItems(items []pendingItem, seq uint64) {

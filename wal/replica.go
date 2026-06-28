@@ -28,6 +28,13 @@ type ReplicaConfig struct {
 	// default). Larger values trade a few extra re-applied segments after a
 	// crash (idempotent) for fewer fsyncs.
 	CursorSaveInterval int
+	// MaxRecordsPerPoll bounds how many records a single Poll applies: once a
+	// poll has applied at least this many, it stops at the next segment boundary
+	// (cursor saved there) and returns, leaving the rest for the following Poll.
+	// 0 means unbounded (drain everything available). Granularity is a whole
+	// segment, so the effective cap is "the first segment boundary at or past
+	// this count". Useful for pacing ingestion so progress is observable.
+	MaxRecordsPerPoll int
 }
 
 func (c *ReplicaConfig) withDefaults() {
@@ -92,12 +99,13 @@ func (r *Replica) Poll(ctx context.Context) (int, error) {
 	if !ok {
 		return 0, nil // manifest not created yet
 	}
-	entries, err := m.EntriesFrom(r.next)
+	entries, err := m.EntriesContaining(r.next)
 	if err != nil {
 		return 0, err
 	}
 	applied := 0
 	sinceSave := 0
+	resumeAt := r.next // records below this were already applied (mid-segment resume)
 	saveCursor := func() error {
 		if r.cursor == nil {
 			return nil
@@ -117,19 +125,32 @@ func (r *Replica) Poll(ctx context.Context) (int, error) {
 		if err != nil {
 			return applied, fmt.Errorf("wal: replica decode %s: %w", e.Location, err)
 		}
+		perRecord := e.Count > 0
 		for i, data := range records {
-			rec := Record{Sequence: e.Sequence, GroupMeta: groupMetaFor(e.Metadata, i), Data: data}
+			recSeq := e.Sequence
+			if perRecord {
+				recSeq = e.Sequence + uint64(i)
+			}
+			if recSeq < resumeAt {
+				continue // already applied; resuming mid-segment from resumeAt
+			}
+			rec := Record{Sequence: recSeq, GroupMeta: groupMetaFor(e.Metadata, i), Data: data}
 			if err := r.apply.Apply(ctx, rec); err != nil {
-				return applied, fmt.Errorf("wal: apply seq %d: %w", e.Sequence, err)
+				return applied, fmt.Errorf("wal: apply seq %d: %w", recSeq, err)
 			}
 			applied++
 		}
-		r.next = e.Sequence + 1
+		r.next = e.End()
 		sinceSave++
 		if sinceSave >= r.cfg.CursorSaveInterval {
 			if err := saveCursor(); err != nil {
 				return applied, err
 			}
+		}
+		// Pace ingestion: stop at this segment boundary once the per-poll budget
+		// is met. The trailing saveCursor below persists r.next = e.End().
+		if r.cfg.MaxRecordsPerPoll > 0 && applied >= r.cfg.MaxRecordsPerPoll {
+			break
 		}
 	}
 	// Always persist the final position at the end of a poll that advanced.

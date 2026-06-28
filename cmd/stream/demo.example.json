@@ -1,0 +1,28 @@
+{
+  "endpoint": "http://localhost:9000",
+  "access_key": "minioadmin",
+  "secret_key": "minioadmin",
+  "region": "us-east-1",
+  "bucket": "objwal-demo",
+  "path_style": true,
+  "create_bucket": true,
+
+  "manifest_path": "wal/manifest",
+  "segment_prefix": "wal/segments",
+
+  "flush_interval_ms": 200,
+  "segment_max_bytes": 65536,
+  "batch_size": 1,
+  "append_delay_ms": 500,
+  "loop": false,
+
+  "out_dir": "./_demo_data",
+  "cursor_path": "./_demo_data/cursor",
+  "bucket_size": 1000,
+  "max_rows": 2000,
+  "compression": "zstd",
+  "poll_interval_ms": 1000,
+
+  "dedup": true,
+  "no_clear": false
+}

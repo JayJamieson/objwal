@@ -183,8 +183,8 @@ func runWrite(args []string) error {
 }
 
 // runWriteLatency measures per-record durable-commit latency. Each worker times
-// a single Append→Wait round trip — the real time from submission to manifest
-// commit — so up to `concurrency` records are in flight at once. Unlike the
+// a single Append→Wait round trip - the real time from submission to manifest
+// commit - so up to `concurrency` records are in flight at once. Unlike the
 // throughput path (which fires every Append then waits the batch), this reflects
 // what a caller actually observes per write, including the FlushInterval the
 // record waits to be sealed. Drive it with small flush thresholds and low
@@ -307,7 +307,7 @@ func runRead(args []string) error {
 	elapsed := time.Since(start)
 
 	if records == 0 {
-		return fmt.Errorf("no records under manifest %q — run \"s3bench write\" first", c.manifest)
+		return fmt.Errorf("no records under manifest %q - run \"s3bench write\" first", c.manifest)
 	}
 
 	report("read", read, int(records), elapsed)
