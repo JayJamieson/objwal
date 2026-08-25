@@ -25,6 +25,12 @@ var (
 	// ErrAlreadyExists is returned by a create-mode Put when the object
 	// already exists.
 	ErrAlreadyExists = errors.New("object already exists")
+	// ErrConflict is returned when the store rejected a conditional write
+	// because another conditional write to the same key was in flight (S3
+	// 409 ConditionalRequestConflict). The write did NOT land, and unlike
+	// ErrPreconditionFailed it carries no information about the object's
+	// current version: the caller should retry with backoff.
+	ErrConflict = errors.New("conditional request conflict")
 )
 
 // UpdateVersion identifies the version of an object as observed by a Get,

@@ -4,9 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
+
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -115,6 +120,9 @@ func (s *S3) PutOpts(ctx context.Context, path string, data []byte, opts PutOpti
 	}
 	_, err := s.client.PutObject(ctx, input)
 	if err != nil {
+		if isConflict(err) {
+			return fmt.Errorf("%w: %s", ErrConflict, err)
+		}
 		if isPreconditionFailed(err) {
 			if opts.Mode == PutCreate {
 				return ErrAlreadyExists
@@ -173,6 +181,34 @@ func (s *S3) Delete(ctx context.Context, path string) error {
 	return err
 }
 
+// httpStatus extracts the HTTP status code from an SDK error, or 0.
+//
+// Classification is by status code and typed error, never by substring match
+// on the rendered message: the message format is not part of the SDK's
+// contract, and a misclassification here silently changes the CAS protocol's
+// meaning.
+func httpStatus(err error) int {
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.HTTPStatusCode() != 0 {
+		return re.HTTPStatusCode()
+	}
+	var sre *smithyhttp.ResponseError
+	if errors.As(err, &sre) && sre.Response != nil {
+		return sre.Response.StatusCode
+	}
+	return 0
+}
+
+// apiCode returns the service-level error code (e.g. "NoSuchKey",
+// "PreconditionFailed", "ConditionalRequestConflict"), or "".
+func apiCode(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode()
+	}
+	return ""
+}
+
 func isNotFound(err error) bool {
 	var nsk *types.NoSuchKey
 	if errors.As(err, &nsk) {
@@ -182,17 +218,38 @@ func isNotFound(err error) bool {
 	if errors.As(err, &nf) {
 		return true
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "StatusCode: 404")
+	// A bare 404 is only NoSuchKey for a GET on an existing bucket; NoSuchBucket
+	// is also 404 and must NOT be reported as "the object is absent", or a
+	// misconfigured bucket looks like an empty log.
+	switch apiCode(err) {
+	case "NoSuchKey", "NotFound":
+		return true
+	case "NoSuchBucket":
+		return false
+	}
+	return httpStatus(err) == 404 && apiCode(err) == ""
 }
 
+// isPreconditionFailed reports a 412: the precondition definitively did not
+// hold, and the write did not land.
 func isPreconditionFailed(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "PreconditionFailed") ||
-		strings.Contains(msg, "StatusCode: 412") ||
-		strings.Contains(msg, "StatusCode: 409") ||
-		strings.Contains(msg, "ConditionalRequestConflict") ||
-		strings.Contains(msg, "At least one of the pre-conditions")
+	if apiCode(err) == "PreconditionFailed" {
+		return true
+	}
+	return httpStatus(err) == 412
+}
+
+// isConflict reports a 409 ConditionalRequestConflict: another conditional
+// write to the same key was in flight. The write did not land, but unlike a
+// 412 this says nothing about the object's current version - S3's guidance is
+// to retry with backoff. Collapsing it into ErrPreconditionFailed turns it
+// into a "free re-plan", which is an unbounded spin against the one key that
+// must not be hammered.
+func isConflict(err error) bool {
+	if apiCode(err) == "ConditionalRequestConflict" {
+		return true
+	}
+	return httpStatus(err) == 409
 }
 
 // compile-time assertions.
