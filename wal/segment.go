@@ -25,18 +25,15 @@ import (
 //
 //	[ record block ][ compression_type: u8 ][ record_count: u32 LE ][ version (=1): u16 LE ]
 //
-// The checksum covers the block AS STORED plus the compression and count
-// fields, so a corrupted count or codec byte is caught too, and a corrupt
-// object is rejected before any zstd work is done. Only the version field is
-// outside the digest; it is validated structurally.
+// The checksum covers the block as stored plus the compression and count
+// fields, so a corrupt object is rejected before any zstd work. Only the
+// version field is outside the digest; it is validated structurally.
 //
-// Records are opaque []byte. This package attaches no meaning to their
-// contents; that is the Applier's concern.
+// Records are opaque []byte; their meaning is the Applier's concern.
 
-// ErrCorrupt reports that stored bytes failed their integrity check. It is
-// deliberately distinct from a transport error: a caller that retries a GET on
-// ErrCorrupt will simply read the same bad bytes again, whereas a retry on a
-// network error may succeed. Replication should stop and escalate.
+// ErrCorrupt reports that stored bytes failed their integrity check. Distinct
+// from a transport error: retrying the GET re-reads the same bad bytes, so
+// replication should stop rather than spin.
 var ErrCorrupt = errors.New("wal: checksum mismatch (corrupt object)")
 
 // Compression selects the codec applied to a segment's record block.
@@ -56,9 +53,8 @@ const (
 	segmentFooterSize           = 1 + 4 + 4 + 2 // + crc32c u32
 )
 
-// castagnoli is CRC-32C (Castagnoli): hardware-accelerated on amd64 and arm64,
-// and a stronger polynomial than IEEE for the short-burst errors that storage
-// and transport corruption actually produce.
+// CRC-32C: hardware-accelerated on amd64/arm64 and stronger than IEEE for
+// short-burst errors.
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 var (

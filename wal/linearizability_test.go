@@ -16,21 +16,14 @@ import (
 	"github.com/JayJamieson/objwal/wal"
 )
 
-// The model: an exactly-once, totally ordered log of record ids.
+// Model: an exactly-once, totally ordered log of record ids. State is the
+// committed log, encoded as "|a|b|c|" so it is == comparable.
 //
-// State is the committed log, encoded as "|a|b|c|" so it is == comparable and
-// membership is a substring test.
-//
-// Operations:
-//
-//	append(id) -> seq   the id is placed at position seq; committing the same
-//	                    id twice is NOT a legal step, and that is precisely
-//	                    the guarantee an ambiguous manifest CAS threatens.
-//	append(id) -> ???   outcome unknown (the response was lost). Legal either
-//	                    way: nondeterministic step returns both the state that
-//	                    accepted it and the one that did not.
-//	read()     -> log   an atomic read of the manifest; must equal the state
-//	                    exactly, which is what prunes the nondeterminism.
+//	append(id) -> seq   legal only if id is uncommitted and seq is its position
+//	append(id) -> ???   outcome unknown; branches into landed and not-landed,
+//	                    never into landed-twice
+//	read()     -> log   atomic manifest read; must equal state exactly, which
+//	                    prunes the branching
 const (
 	opAppend = "append"
 	opRead   = "read"
@@ -109,10 +102,8 @@ var logModel = porcupine.NondeterministicModel{
 	DescribeState: func(st interface{}) string { return st.(string) },
 }
 
-// readLog performs an atomic read of the committed log: one GET of the
-// manifest, then the ordered per-Append-group metadata payloads, which carry
-// the record ids. Coalescing is transparent here - an entry holds one
-// RecordMeta per Append group, in order.
+// readLog reads the committed log atomically: one manifest GET, then the
+// ordered per-group metadata payloads carrying the record ids.
 func readLog(ctx context.Context, os objectstore.ObjectStore, path string) (string, error) {
 	m, _, ok, err := wal.NewStore(os, path).Load(ctx)
 	if err != nil || !ok {
@@ -146,9 +137,8 @@ func (r *recorder) add(client int, in logInput, call int64, out logOutput, ret i
 
 func now() int64 { return time.Now().UnixNano() }
 
-// runOnce drives concurrent appenders and readers against one producer whose
-// object store injects ambiguous failures on the manifest key, then checks the
-// resulting history for linearizability.
+// runOnce drives concurrent appenders and readers against a producer whose
+// store injects faults on the manifest key, then checks the history.
 func runOnce(t *testing.T, seed uint64, ambiguous, clean float64) {
 	t.Helper()
 	const (
@@ -292,19 +282,16 @@ func TestLinearizable_NoFaults(t *testing.T) {
 	}
 }
 
-// TestLinearizable_AmbiguousCommits is the real test. The manifest CAS
-// sometimes lands and then reports failure - the S3 "timeout after the write
-// applied" case. A writer that re-appends instead of checking whether its own
-// entries already landed puts the same record in the log twice, which the
-// model rejects.
+// TestLinearizable_AmbiguousCommits: the manifest CAS sometimes lands and then
+// reports failure. A writer that re-appends rather than checking whether its
+// entries landed duplicates records, which the model rejects.
 func TestLinearizable_AmbiguousCommits(t *testing.T) {
 	for _, s := range seeds(t) {
 		runOnce(t, s, 0.25, 0)
 	}
 }
 
-// TestLinearizable_Mixed adds clean failures on top, exercising the retry and
-// re-plan paths as well.
+// TestLinearizable_Mixed adds clean failures, exercising the re-plan path.
 func TestLinearizable_Mixed(t *testing.T) {
 	for _, s := range seeds(t) {
 		runOnce(t, s, 0.35, 0.25)

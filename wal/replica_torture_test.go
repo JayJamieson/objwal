@@ -11,16 +11,10 @@ import (
 	"github.com/JayJamieson/objwal/wal"
 )
 
-// SUSPECT 9: an Applier that fails part-way through a segment.
-//
-// This is the sharpest remaining data-loss shape. A segment holds N records
-// and Apply is called per record. If Apply fails on record k, the replica must
-// NOT persist a cursor past k: on restart it would resume after records that
-// were never applied, and they are gone forever with no error surfaced. The
-// replica's whole contract is that its state is a prefix of the log.
-//
-// Apply is idempotent by contract, so re-delivering records 0..k-1 is fine.
-// Skipping k..N-1 is not.
+// An Applier failing part-way through a segment. If Apply fails on record k,
+// the replica must not persist a cursor past k, or a restart resumes after
+// records that were never applied and they are lost silently. Re-delivering
+// records is fine (Apply is idempotent); skipping them is not.
 func TestApplierFailsMidSegment_NoRecordsSkipped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -119,12 +113,8 @@ func TestApplierFailsMidSegment_NoRecordsSkipped(t *testing.T) {
 	}
 }
 
-// SUSPECT 10: bootstrap from a mid-log sequence (ReplicaConfig.StartAt).
-//
-// Untested so far: every replica in these tests started at zero. A replica
-// that starts at a sequence in the MIDDLE of a segment's range must deliver
-// exactly the records from that sequence onward - not the whole segment, and
-// not skip to the next one.
+// Bootstrap from a mid-log sequence. A replica starting inside a segment's
+// range must deliver the records from that sequence onward.
 func TestReplicaStartAt_MidSegment(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

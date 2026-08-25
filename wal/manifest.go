@@ -30,11 +30,9 @@ import (
 
 // Footer/format constants.
 const (
-	// FooterVersion is the version this package writes: v4 is v3 plus a
-	// crc32c over the whole object. The manifest is the ordering authority, so
-	// a silent bit flip in its entry region or in nextSequence/epoch is a
-	// worse failure than a corrupt segment: it misdirects or reorders the
-	// entire log rather than damaging one batch of records.
+	// FooterVersion is the version this package writes: v3 plus a crc32c over
+	// the whole object. The manifest is the ordering authority, so a silent
+	// flip here misdirects the whole log, not one batch of records.
 	FooterVersion uint16 = 4
 	// checksumFooterVersion (v4) adds the digest; recordCountFooterVersion
 	// (v3) carries the snapshot block and per-entry Count;
@@ -50,9 +48,8 @@ const (
 	epochSize        = 8
 	versionSize      = 2
 	checksumSize     = 4
-	// coreFooterSize is the trailing block shared by v1-v3, at identical
-	// offsets from the end of the object. v4 inserts a crc32c between epoch
-	// and version, so use coreFooter(version) rather than this constant when
+	// coreFooterSize is the trailing block shared by v1-v3. v4 inserts a
+	// crc32c between epoch and version, so use coreFooter(version) when
 	// computing offsets from the end.
 	coreFooterSize   = entriesCountSize + sequenceSize + epochSize + versionSize                // 22
 	coreFooterSizeV4 = entriesCountSize + sequenceSize + epochSize + checksumSize + versionSize // 26
@@ -139,10 +136,10 @@ type Manifest struct {
 // NewManifest returns an empty manifest at epoch 0 with no snapshot.
 func NewManifest() *Manifest { return &Manifest{} }
 
-// ParseManifest decodes a serialized manifest. It accepts v3 (this package), v2
-// (snapshot, one sequence per entry), and v1 (the buffer). Legacy (v1/v2)
-// entries are normalized in memory to the v3 encoding with Count==0, so all
-// downstream decoding is uniform and a re-commit upgrades the object to v3.
+// ParseManifest decodes a serialized manifest. It accepts v4 (this package),
+// v3, v2 and v1. Legacy (v1/v2) entries are normalized in memory to the v3
+// encoding with Count==0, so downstream decoding is uniform; a re-commit
+// upgrades the object to v4.
 // coreFooter returns the size of the trailing core block for a footer
 // version. v4 carries a crc32c that the earlier versions do not.
 func coreFooter(version uint16) int {
@@ -162,8 +159,8 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	if n < core {
 		return nil, fmt.Errorf("wal: manifest too short for v%d footer (%d bytes)", version, n)
 	}
-	// Verify before interpreting anything else: every field below, including
-	// the entry count that drives the decode loop, is inside the digest.
+	// Verify first: every field below, including the entry count that drives
+	// the decode loop, is inside the digest.
 	if version == checksumFooterVersion {
 		want := binary.LittleEndian.Uint32(data[n-versionSize-checksumSize : n-versionSize])
 		covered := data[:n-versionSize-checksumSize]
@@ -171,8 +168,7 @@ func ParseManifest(data []byte) (*Manifest, error) {
 			return nil, fmt.Errorf("%w: manifest crc32c %08x, stored %08x", ErrCorrupt, got, want)
 		}
 	}
-	// v4 shifts every core field down by the checksum it inserted before the
-	// version word; tail is the offset of the end of the epoch field.
+	// v4 shifts the core fields down by the checksum before the version word.
 	tail := n - versionSize
 	if version == checksumFooterVersion {
 		tail -= checksumSize
@@ -536,14 +532,10 @@ func decodeEntry(data []byte, offset int, hasCount bool) (Entry, int, error) {
 	return Entry{Sequence: seq, Count: cnt, Location: location, Metadata: md}, end, nil
 }
 
-// TailLocations returns the segment locations of the last `limit` live
-// entries, mapped to their entries. Segment locations are unique per
-// (runID, ordinal), so they are a natural idempotency key: a writer that
-// lost the response to a manifest CAS can ask whether its entries already
-// landed instead of blindly re-appending them.
-//
-// Only the tail is considered because a lost-response re-check is only ever
-// looking for its own just-committed entries, which are necessarily last.
+// TailLocations maps the last `limit` live entries by segment location.
+// Locations are unique per (runID, ordinal), so a writer that lost a CAS
+// response can check whether its entries landed. Only the tail is scanned:
+// those entries are necessarily last.
 func (m *Manifest) TailLocations(limit int) (map[string]Entry, error) {
 	if limit <= 0 {
 		return nil, nil

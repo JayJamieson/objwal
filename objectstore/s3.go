@@ -183,10 +183,9 @@ func (s *S3) Delete(ctx context.Context, path string) error {
 
 // httpStatus extracts the HTTP status code from an SDK error, or 0.
 //
-// Classification is by status code and typed error, never by substring match
-// on the rendered message: the message format is not part of the SDK's
-// contract, and a misclassification here silently changes the CAS protocol's
-// meaning.
+// Classification uses typed errors and status codes, never substring matches
+// on the rendered message: that format is not part of the SDK's contract, and
+// a misclassification silently changes what the CAS protocol means.
 func httpStatus(err error) int {
 	var re *awshttp.ResponseError
 	if errors.As(err, &re) && re.HTTPStatusCode() != 0 {
@@ -218,8 +217,7 @@ func isNotFound(err error) bool {
 	if errors.As(err, &nf) {
 		return true
 	}
-	// A bare 404 is only NoSuchKey for a GET on an existing bucket; NoSuchBucket
-	// is also 404 and must NOT be reported as "the object is absent", or a
+	// NoSuchBucket is also 404 and must not read as "object absent", or a
 	// misconfigured bucket looks like an empty log.
 	switch apiCode(err) {
 	case "NoSuchKey", "NotFound":
@@ -230,8 +228,8 @@ func isNotFound(err error) bool {
 	return httpStatus(err) == 404 && apiCode(err) == ""
 }
 
-// isPreconditionFailed reports a 412: the precondition definitively did not
-// hold, and the write did not land.
+// isPreconditionFailed reports a 412: the precondition did not hold and the
+// write did not land.
 func isPreconditionFailed(err error) bool {
 	if apiCode(err) == "PreconditionFailed" {
 		return true
@@ -239,12 +237,9 @@ func isPreconditionFailed(err error) bool {
 	return httpStatus(err) == 412
 }
 
-// isConflict reports a 409 ConditionalRequestConflict: another conditional
-// write to the same key was in flight. The write did not land, but unlike a
-// 412 this says nothing about the object's current version - S3's guidance is
-// to retry with backoff. Collapsing it into ErrPreconditionFailed turns it
-// into a "free re-plan", which is an unbounded spin against the one key that
-// must not be hammered.
+// isConflict reports a 409 ConditionalRequestConflict. The write did not land,
+// but unlike a 412 it says nothing about the current version, so the caller
+// must retry with backoff rather than re-plan.
 func isConflict(err error) bool {
 	if apiCode(err) == "ConditionalRequestConflict" {
 		return true
