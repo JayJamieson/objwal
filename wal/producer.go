@@ -82,6 +82,11 @@ type ProducerConfig struct {
 	// ManifestInitialBackoff is the first backoff for transient commit retries
 	// (default 100ms).
 	ManifestInitialBackoff time.Duration
+	// MaxCommitConflicts bounds how many times a commit may lose the manifest
+	// CAS race (412) before giving up (default 64). A lost race is normally
+	// resolved by the next load's epoch check turning into ErrFenced; the
+	// bound exists so a misclassified error cannot spin forever.
+	MaxCommitConflicts int
 }
 
 func (c *ProducerConfig) withDefaults() {
@@ -111,6 +116,9 @@ func (c *ProducerConfig) withDefaults() {
 	}
 	if c.ManifestInitialBackoff <= 0 {
 		c.ManifestInitialBackoff = 100 * time.Millisecond
+	}
+	if c.MaxCommitConflicts <= 0 {
+		c.MaxCommitConflicts = 64
 	}
 }
 
@@ -547,7 +555,14 @@ func (p *Producer) planSegments(batch []pendingItem) []segPlan {
 // semantics match the single-entry path.
 func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64, error) {
 	bo := newBackoff(p.cfg.ManifestInitialBackoff)
+	cbo := newBackoff(p.cfg.ManifestInitialBackoff)
 	transient := 0
+	conflicts := 0
+	// unknown is set once a commit attempt returns an error that does NOT
+	// definitively mean "did not land" (a timeout, a reset, a 5xx). From that
+	// point on every attempt must first ask whether the previous PUT actually
+	// landed, or it will append the same entries a second time.
+	unknown := false
 	for {
 		m, ver, _, err := p.store.Load(ctx)
 		if err != nil {
@@ -563,6 +578,19 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		if m.Epoch() != p.epoch {
 			return nil, ErrFenced
 		}
+		// Idempotency: segment locations are unique per (runID, ordinal), so a
+		// lost response can be resolved by looking for our own entries rather
+		// than re-appending them. All plans in a group land in one CAS, so it
+		// is all-or-nothing.
+		if unknown {
+			seqs, ok, herr := harvestCommitted(m, plans)
+			if herr != nil {
+				return nil, herr
+			}
+			if ok {
+				return seqs, nil
+			}
+		}
 		seqs := make([]uint64, len(plans))
 		for i, pl := range plans {
 			s, e := m.Append(pl.location, pl.metas, len(pl.records))
@@ -571,13 +599,44 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 			}
 			seqs[i] = s
 		}
+		// Fencing is enforced by the CAS ETag; this asserts that the epoch we
+		// are about to write back still agrees, so a broken ETag path cannot
+		// silently disable fencing while the epoch field still looks correct.
+		if m.Epoch() != p.epoch {
+			return nil, fmt.Errorf("wal: epoch invariant violated: manifest %d, producer %d", m.Epoch(), p.epoch)
+		}
 		err = p.store.Commit(ctx, m, ver)
 		if err == nil {
 			return seqs, nil
 		}
+		// 412: definitively did not land. Someone else advanced the manifest.
+		// Re-plan for free, but bound it and back off: without a bound this
+		// spins only until a competing writer happens to bump the epoch.
 		if errors.Is(err, objectstore.ErrPreconditionFailed) {
-			continue // free re-plan; epoch check on next load detects fencing
+			conflicts++
+			if conflicts >= p.cfg.MaxCommitConflicts {
+				return nil, fmt.Errorf("wal: commit lost %d CAS races (contended)", conflicts)
+			}
+			if serr := cbo.sleep(ctx); serr != nil {
+				return nil, serr
+			}
+			continue
 		}
+		// 409 ConditionalRequestConflict: a concurrent conditional write to
+		// the same key was in flight. Did not land; S3 asks us to retry with
+		// backoff. Distinct from 412 so it cannot drive the free re-plan loop.
+		if errors.Is(err, objectstore.ErrConflict) {
+			transient++
+			if transient >= p.cfg.ManifestMaxAttempts {
+				return nil, fmt.Errorf("wal: commit conflict after %d attempts: %w", transient, err)
+			}
+			if serr := bo.sleep(ctx); serr != nil {
+				return nil, serr
+			}
+			continue
+		}
+		// Anything else: outcome unknown. The PUT may have landed.
+		unknown = true
 		transient++
 		if transient >= p.cfg.ManifestMaxAttempts {
 			return nil, fmt.Errorf("wal: commit after %d attempts: %w", transient, err)
@@ -585,6 +644,34 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		if serr := bo.sleep(ctx); serr != nil {
 			return nil, serr
 		}
+	}
+}
+
+// harvestCommitted reports whether plans' entries are already present in m
+// (a previous attempt's PUT landed but its response was lost), returning the
+// sequences they were actually assigned. Partial presence is impossible - one
+// CAS carries the whole group - and is treated as a hard error rather than
+// silently re-committing.
+func harvestCommitted(m *Manifest, plans []segPlan) ([]uint64, bool, error) {
+	tail, err := m.TailLocations(len(plans) * 4)
+	if err != nil {
+		return nil, false, err
+	}
+	seqs := make([]uint64, len(plans))
+	found := 0
+	for i, pl := range plans {
+		if e, ok := tail[pl.location]; ok {
+			seqs[i] = e.Sequence
+			found++
+		}
+	}
+	switch found {
+	case 0:
+		return nil, false, nil
+	case len(plans):
+		return seqs, true, nil
+	default:
+		return nil, false, fmt.Errorf("wal: manifest holds %d/%d entries of an atomic commit group", found, len(plans))
 	}
 }
 
