@@ -6,19 +6,39 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
+
+// s3APIError builds an error with the same structure the SDK produces for a
+// service error: awshttp.ResponseError -> smithyhttp.ResponseError (status)
+// -> smithy.APIError (code).
+func s3APIError(status int, code, msg string) error {
+	return fmt.Errorf("operation error S3: %w", &awshttp.ResponseError{
+		ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+			Err:      &smithy.GenericAPIError{Code: code, Message: msg},
+		},
+	})
+}
 
 // fakeS3 implements the narrow s3API with in-memory objects and faithful
 // conditional-write semantics, so the adapter's header-setting and
-// error-mapping are exercised without a live bucket. Errors are shaped so the
-// adapter's isNotFound / isPreconditionFailed classifiers match (NoSuchKey via
-// the typed error; precondition via the message), exactly as real S3 returns.
+// error-mapping are exercised without a live bucket.
+//
+// Errors are shaped the way the SDK actually delivers them: a transport
+// ResponseError carrying the HTTP status, wrapping a smithy APIError carrying
+// the service error code. The adapter classifies on those, never on the
+// rendered message, so the fake has to produce the real shape or it is
+// testing something the SDK never emits.
 type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string]fakeObj
@@ -40,13 +60,13 @@ func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*
 
 	if in.IfNoneMatch != nil { // create-only
 		if exists {
-			return nil, errors.New("api error PreconditionFailed: At least one of the pre-conditions you specified did not hold (status code: 412)")
+			return nil, s3APIError(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold")
 		}
 	}
 	if in.IfMatch != nil { // update-if-version-matches
 		want := strings.Trim(*in.IfMatch, `"`)
 		if !exists || existing.etag != want {
-			return nil, errors.New("api error PreconditionFailed: At least one of the pre-conditions you specified did not hold (status code: 412)")
+			return nil, s3APIError(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold")
 		}
 	}
 
