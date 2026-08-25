@@ -154,14 +154,15 @@ func runOnce(t *testing.T, seed uint64, ambiguous, clean float64) {
 	const (
 		clients    = 4
 		perClient  = 25
-		manifest   = "wal/manifest"
-		segPrefix  = "wal/seg"
 		readerPoll = 700 * time.Microsecond
 	)
+	inner, keyPrefix := backingStore(t)
+	manifest := keyPrefix + "wal/manifest"
+	segPrefix := keyPrefix + "wal/seg"
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	mem := objectstore.NewInMemory()
+	mem := inner
 	sim := objectstore.NewSimStore(mem, seed, objectstore.Faults{
 		FailAmbiguous: ambiguous,
 		FailClean:     clean,

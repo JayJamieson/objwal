@@ -40,6 +40,12 @@ type ProducerConfig struct {
 	FlushBytes int
 	// Compression applied to segment record blocks.
 	Compression Compression
+	// LegacySegmentFormat writes segments in the buffer's unchecksummed
+	// batch-v1 framing instead of v2. Only set this if something downstream
+	// consumes objwal segments as upstream buffer batches; it gives up
+	// corruption detection on the record block. Reading v1 is always
+	// supported regardless.
+	LegacySegmentFormat bool
 
 	// MaxInFlightBytes caps the total bytes Appended but not yet durably
 	// committed. Append BLOCKS once a further record would exceed it - the
@@ -444,7 +450,7 @@ func (p *Producer) flush(ctx context.Context) error {
 			defer wg.Done()
 			p.uploadSem <- struct{}{}
 			defer func() { <-p.uploadSem }()
-			seg, err := encodeSegment(plans[i].records, p.cfg.Compression)
+			seg, err := encodeSegment(plans[i].records, p.cfg.Compression, p.cfg.LegacySegmentFormat)
 			if err != nil {
 				results[i] = err
 				return

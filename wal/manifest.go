@@ -24,26 +24,38 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math"
 )
 
 // Footer/format constants.
 const (
-	// FooterVersion is the version this package writes: v3 carries the snapshot
-	// block (like v2) and per-entry record Count for per-record sequencing.
-	FooterVersion uint16 = 3
-	// snapshotFooterVersion (v2) carries the snapshot block but one sequence per
-	// entry. bufferFooterVersion (v1) is the buffer's footer with neither.
-	snapshotFooterVersion uint16 = 2
-	bufferFooterVersion   uint16 = 1
+	// FooterVersion is the version this package writes: v4 is v3 plus a
+	// crc32c over the whole object. The manifest is the ordering authority, so
+	// a silent bit flip in its entry region or in nextSequence/epoch is a
+	// worse failure than a corrupt segment: it misdirects or reorders the
+	// entire log rather than damaging one batch of records.
+	FooterVersion uint16 = 4
+	// checksumFooterVersion (v4) adds the digest; recordCountFooterVersion
+	// (v3) carries the snapshot block and per-entry Count;
+	// snapshotFooterVersion (v2) carries the snapshot block with one sequence
+	// per entry; bufferFooterVersion (v1) is the buffer's footer with neither.
+	checksumFooterVersion    uint16 = 4
+	recordCountFooterVersion uint16 = 3
+	snapshotFooterVersion    uint16 = 2
+	bufferFooterVersion      uint16 = 1
 
 	entriesCountSize = 4
 	sequenceSize     = 8
 	epochSize        = 8
 	versionSize      = 2
-	// coreFooter is the trailing block shared by all versions, at identical
-	// offsets from the end of the object.
-	coreFooterSize = entriesCountSize + sequenceSize + epochSize + versionSize // 22
+	checksumSize     = 4
+	// coreFooterSize is the trailing block shared by v1-v3, at identical
+	// offsets from the end of the object. v4 inserts a crc32c between epoch
+	// and version, so use coreFooter(version) rather than this constant when
+	// computing offsets from the end.
+	coreFooterSize   = entriesCountSize + sequenceSize + epochSize + versionSize                // 22
+	coreFooterSizeV4 = entriesCountSize + sequenceSize + epochSize + checksumSize + versionSize // 26
 
 	snapLocLenSize  = 2
 	snapThroughSize = 8
@@ -131,15 +143,43 @@ func NewManifest() *Manifest { return &Manifest{} }
 // (snapshot, one sequence per entry), and v1 (the buffer). Legacy (v1/v2)
 // entries are normalized in memory to the v3 encoding with Count==0, so all
 // downstream decoding is uniform and a re-commit upgrades the object to v3.
+// coreFooter returns the size of the trailing core block for a footer
+// version. v4 carries a crc32c that the earlier versions do not.
+func coreFooter(version uint16) int {
+	if version == checksumFooterVersion {
+		return coreFooterSizeV4
+	}
+	return coreFooterSize
+}
+
 func ParseManifest(data []byte) (*Manifest, error) {
 	if len(data) < coreFooterSize {
 		return nil, fmt.Errorf("wal: manifest too short for footer (%d bytes)", len(data))
 	}
 	n := len(data)
 	version := binary.LittleEndian.Uint16(data[n-versionSize:])
-	epoch := binary.LittleEndian.Uint64(data[n-versionSize-epochSize : n-versionSize])
-	nextSeq := binary.LittleEndian.Uint64(data[n-versionSize-epochSize-sequenceSize : n-versionSize-epochSize])
-	count := int(binary.LittleEndian.Uint32(data[n-coreFooterSize : n-coreFooterSize+entriesCountSize]))
+	core := coreFooter(version)
+	if n < core {
+		return nil, fmt.Errorf("wal: manifest too short for v%d footer (%d bytes)", version, n)
+	}
+	// Verify before interpreting anything else: every field below, including
+	// the entry count that drives the decode loop, is inside the digest.
+	if version == checksumFooterVersion {
+		want := binary.LittleEndian.Uint32(data[n-versionSize-checksumSize : n-versionSize])
+		covered := data[:n-versionSize-checksumSize]
+		if got := crc32.Checksum(covered, castagnoli); got != want {
+			return nil, fmt.Errorf("%w: manifest crc32c %08x, stored %08x", ErrCorrupt, got, want)
+		}
+	}
+	// v4 shifts every core field down by the checksum it inserted before the
+	// version word; tail is the offset of the end of the epoch field.
+	tail := n - versionSize
+	if version == checksumFooterVersion {
+		tail -= checksumSize
+	}
+	epoch := binary.LittleEndian.Uint64(data[tail-epochSize : tail])
+	nextSeq := binary.LittleEndian.Uint64(data[tail-epochSize-sequenceSize : tail-epochSize])
+	count := int(binary.LittleEndian.Uint32(data[n-core : n-core+entriesCountSize]))
 
 	m := &Manifest{baseCount: count, nextSequence: nextSeq, epoch: epoch}
 
@@ -148,11 +188,11 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	switch version {
 	case bufferFooterVersion:
 		base = data[:n-coreFooterSize]
-	case snapshotFooterVersion, FooterVersion:
-		if n < coreFooterSize+snapFixedSize {
+	case snapshotFooterVersion, recordCountFooterVersion, checksumFooterVersion:
+		if n < core+snapFixedSize {
 			return nil, fmt.Errorf("wal: manifest too short for snapshot block (%d bytes)", n)
 		}
-		snapEnd := n - coreFooterSize
+		snapEnd := n - core
 		createdStart := snapEnd - snapCreatedSize
 		throughStart := createdStart - snapThroughSize
 		locLenStart := throughStart - snapLocLenSize
@@ -169,7 +209,7 @@ func ParseManifest(data []byte) (*Manifest, error) {
 			m.snapshot = SnapshotPointer{ThroughSeq: through, CreatedUnixMs: created}
 		}
 		base = data[:locStart]
-		hasCount = version == FooterVersion
+		hasCount = version == recordCountFooterVersion || version == checksumFooterVersion
 	default:
 		return nil, fmt.Errorf("wal: unsupported manifest version %d", version)
 	}
@@ -216,7 +256,7 @@ func (m *Manifest) Bytes() ([]byte, error) {
 	if len(loc) > math.MaxUint16 {
 		return nil, fmt.Errorf("wal: snapshot location length %d exceeds u16 max", len(loc))
 	}
-	size := len(m.base) + len(m.appended) + len(loc) + snapFixedSize + coreFooterSize
+	size := len(m.base) + len(m.appended) + len(loc) + snapFixedSize + coreFooterSizeV4
 	buf := make([]byte, 0, size)
 	buf = append(buf, m.base...)
 	buf = append(buf, m.appended...)
@@ -227,6 +267,7 @@ func (m *Manifest) Bytes() ([]byte, error) {
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(total))
 	buf = binary.LittleEndian.AppendUint64(buf, m.nextSequence)
 	buf = binary.LittleEndian.AppendUint64(buf, m.epoch)
+	buf = binary.LittleEndian.AppendUint32(buf, crc32.Checksum(buf, castagnoli))
 	buf = binary.LittleEndian.AppendUint16(buf, FooterVersion)
 	return buf, nil
 }
