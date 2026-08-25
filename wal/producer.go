@@ -95,7 +95,7 @@ func (c *ProducerConfig) withDefaults() {
 		c.MaxInFlightBatches = defaultMaxInFlightBatches
 	}
 	if c.MaxClaimAttempts <= 0 {
-		c.MaxClaimAttempts = 8
+		c.MaxClaimAttempts = 16
 	}
 	if c.UploadMaxAttempts <= 0 {
 		c.UploadMaxAttempts = 6
@@ -265,12 +265,25 @@ func NewProducer(ctx context.Context, os objectstore.ObjectStore, cfg ProducerCo
 func (p *Producer) Epoch() uint64 { return p.epoch }
 
 // claim bumps the manifest epoch under CAS, establishing this producer as the
-// current primary. A concurrent claimant may force a retry.
+// current primary.
+//
+// Every failure mode - a lost race, a transient error, or an ambiguous PUT
+// whose response was lost - is handled by the same retry: reload, bump again,
+// re-CAS. That is safe without a claimant identity in the manifest because a
+// claim only ever succeeds on a CAS that returned cleanly, and a retry's
+// higher epoch supersedes any earlier attempt of ours that silently landed.
+// The cost is epoch inflation under flapping, which is free in a uint64.
 func (p *Producer) claim(ctx context.Context) error {
+	bo := newBackoff(p.cfg.ManifestInitialBackoff)
+	var last error
 	for attempt := 0; attempt < p.cfg.MaxClaimAttempts; attempt++ {
 		m, ver, ok, err := p.store.Load(ctx)
 		if err != nil {
-			return fmt.Errorf("wal: claim load: %w", err)
+			last = fmt.Errorf("wal: claim load: %w", err)
+			if serr := bo.sleep(ctx); serr != nil {
+				return serr
+			}
+			continue
 		}
 		myEpoch := m.Epoch() + 1
 		m.SetEpoch(myEpoch)
@@ -284,12 +297,15 @@ func (p *Producer) claim(ctx context.Context) error {
 			p.epoch = myEpoch
 			return nil
 		}
-		if errors.Is(cErr, objectstore.ErrPreconditionFailed) || errors.Is(cErr, objectstore.ErrAlreadyExists) {
-			continue
+		last = fmt.Errorf("wal: claim commit: %w", cErr)
+		// A lost race is a free immediate re-plan; anything else backs off.
+		if !errors.Is(cErr, objectstore.ErrPreconditionFailed) && !errors.Is(cErr, objectstore.ErrAlreadyExists) {
+			if serr := bo.sleep(ctx); serr != nil {
+				return serr
+			}
 		}
-		return fmt.Errorf("wal: claim commit: %w", cErr)
 	}
-	return fmt.Errorf("wal: claim exceeded %d attempts (contended)", p.cfg.MaxClaimAttempts)
+	return fmt.Errorf("wal: claim exceeded %d attempts: %w", p.cfg.MaxClaimAttempts, last)
 }
 
 // Append enqueues a group of framed records with an optional metadata payload.
