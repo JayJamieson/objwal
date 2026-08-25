@@ -108,9 +108,20 @@ func TestCoreFooterOffsetsStable(t *testing.T) {
 
 	a := mustBytes(t, withSnap)
 	b := mustBytes(t, noSnap)
-	// epoch lives at [n-10 : n-2] in both.
-	ea := binary.LittleEndian.Uint64(a[len(a)-10 : len(a)-2])
-	eb := binary.LittleEndian.Uint64(b[len(b)-10 : len(b)-2])
+	// The invariant is that core-footer fields sit at fixed offsets from the
+	// end for a GIVEN version, whether or not a snapshot block precedes them -
+	// not that the offsets are the same across versions. v4 inserts a crc32c
+	// between epoch and version, so derive the offset from the version rather
+	// than hardcoding it.
+	epochAt := func(buf []byte) uint64 {
+		n := len(buf)
+		end := n - versionSize
+		if binary.LittleEndian.Uint16(buf[n-versionSize:]) == checksumFooterVersion {
+			end -= checksumSize
+		}
+		return binary.LittleEndian.Uint64(buf[end-epochSize : end])
+	}
+	ea, eb := epochAt(a), epochAt(b)
 	if ea != 9 || eb != 9 {
 		t.Fatalf("epoch offset unstable: withSnap=%d noSnap=%d", ea, eb)
 	}

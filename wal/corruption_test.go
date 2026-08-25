@@ -2,7 +2,6 @@ package wal_test
 
 import (
 	"context"
-	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -11,30 +10,16 @@ import (
 	"github.com/JayJamieson/objwal/wal"
 )
 
-// TestCorruption_IsSilent pins the consequence of having no checksum anywhere
+// TestCorruption_IsDetected pins the consequence of having no checksum anywhere
 // in the segment or manifest formats. Each case writes a healthy log, corrupts
 // ONE byte of a committed object, and reports whether a replica rejects it or
 // applies something wrong.
 //
-// Measured today (OBJWAL_EXPECT_CHECKSUMS=1):
-//
-//	segment body bit-flip           SILENT - 1/12 records applied with wrong content
-//	record length prefix corrupted  SILENT - 1/12 records applied with wrong content
-//	segment truncated               detected, via the footer version field
-//	manifest next_sequence perturbed  survived, no observable change
-//
-// Only the truncation case is caught, and only incidentally: the 7-byte footer
-// carries compression and version, which are structurally validated. Payload
-// bytes are not covered by anything. Skipped by default so the suite stays
-// green; it becomes the regression test for integrity checking.
-func TestCorruption_IsSilent(t *testing.T) {
-	strict := os.Getenv("OBJWAL_EXPECT_CHECKSUMS") != ""
-	if !strict {
-		t.Skip("known gap: the segment and manifest formats carry no checksum, so a " +
-			"single flipped payload byte is applied silently. Run with " +
-			"OBJWAL_EXPECT_CHECKSUMS=1 to assert detection; this test goes green " +
-			"when integrity checking lands.")
-	}
+// Before segment footer v2 and manifest footer v4, three of these four cases
+// were silent - a flipped payload byte was applied straight into the replica's
+// state machine, and only truncation was caught, incidentally, by the footer
+// version field. All four are now detected by crc32c.
+func TestCorruption_IsDetected(t *testing.T) {
 	cases := []struct {
 		name   string
 		mutate func(t *testing.T, store objectstore.ObjectStore, manifest, seg string)
