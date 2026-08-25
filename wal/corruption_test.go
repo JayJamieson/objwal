@@ -10,15 +10,10 @@ import (
 	"github.com/JayJamieson/objwal/wal"
 )
 
-// TestCorruption_IsDetected pins the consequence of having no checksum anywhere
-// in the segment or manifest formats. Each case writes a healthy log, corrupts
-// ONE byte of a committed object, and reports whether a replica rejects it or
-// applies something wrong.
-//
-// Before segment footer v2 and manifest footer v4, three of these four cases
-// were silent - a flipped payload byte was applied straight into the replica's
-// state machine, and only truncation was caught, incidentally, by the footer
-// version field. All four are now detected by crc32c.
+// TestCorruption_IsDetected writes a healthy log, corrupts one byte of a
+// committed object, and checks the replica rejects it rather than applying
+// something wrong. Before segment footer v2 and manifest footer v4, three of
+// these four cases were silent.
 func TestCorruption_IsDetected(t *testing.T) {
 	cases := []struct {
 		name   string

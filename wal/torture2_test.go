@@ -12,17 +12,10 @@ import (
 	"github.com/JayJamieson/objwal/wal"
 )
 
-// SUSPECT 6: in-flight budget accounting.
-//
-// Append reserves inFlightBytes/inFlightCount and blocks on p.released when
-// both budgets are full. Every take path must eventually release exactly what
-// it reserved, through resolvePlan or failItems. If any path leaks a
-// reservation, the budget never recovers and Append blocks FOREVER - the
-// admission rule only bypasses the budget when inFlightCount == 0.
-//
-// Driven with a deliberately tiny budget so almost every Append must wait, and
-// with faults forcing halts, upload failures and failovers so the error paths
-// carry reservations too.
+// In-flight budget accounting. Every take path must release exactly what it
+// reserved; a leak wedges Append forever, since the admission rule only
+// bypasses the budget when inFlightCount == 0. Driven with a tiny budget and
+// faults so the error paths carry reservations too.
 func TestBudgetAccounting_NeverWedges(t *testing.T) {
 	for _, seed := range seeds(t) {
 		func() {
@@ -119,14 +112,10 @@ func TestBudgetAccounting_NeverWedges(t *testing.T) {
 	}
 }
 
-// SUSPECT 7: an Append larger than SegmentMaxBytes, and an Append larger than
-// the entire in-flight budget.
-//
-// The admission rule bypasses the budget only when inFlightCount == 0, so an
-// oversized lone Append is meant to always get through. Under contention it
-// must still not starve forever. Separately, a group must never be SPLIT
-// across segments: resolvePlan hands the whole group one base sequence, so a
-// split would silently misreport where a group's records landed.
+// An Append larger than SegmentMaxBytes and than the whole in-flight budget
+// must still be admitted under contention, and must never be split across
+// segments: resolvePlan gives the whole group one base sequence, so a split
+// would misreport where its records landed.
 func TestOversizedAppend(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -210,7 +199,7 @@ func TestOversizedAppend(t *testing.T) {
 	}
 }
 
-// SUSPECT 8: Durability resolution under concurrent and repeated Wait.
+// Durability resolution under concurrent and repeated Wait.
 func TestDurability_ConcurrentAndRepeatedWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

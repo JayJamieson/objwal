@@ -15,11 +15,9 @@ import (
 	"github.com/JayJamieson/objwal/wal"
 )
 
-// prefixOracle tails the log with a REAL wal.Replica and asserts, continuously,
-// that what the replica has applied is always an exact prefix of the committed
-// log - never a gap, never a reorder, never an entry the manifest does not
-// hold. The porcupine harness reads the manifest directly, so it never
-// exercises the replica path at all; this does.
+// prefixOracle tails the log with a real wal.Replica and asserts its applied
+// state is always an exact prefix of the committed log. The porcupine harness
+// reads the manifest directly and never exercises the replica path.
 type prefixOracle struct {
 	mu      sync.Mutex
 	applied []string
@@ -52,20 +50,13 @@ func (o *prefixOracle) snapshot() (string, error) {
 
 func errAt(f string, a ...interface{}) error { return fmt.Errorf(f, a...) }
 
-// TestFailover_ZombiePrimary is the fencing test.
+// TestFailover_ZombiePrimary tests fencing. Appenders write continuously while
+// a chaos goroutine constructs a new producer - bumping the epoch and fencing
+// the incumbent - then abandons the old one without Close(), leaving its flush
+// loop running: a zombie primary that has not noticed it lost the log.
 //
-// Appenders write continuously while a chaos goroutine repeatedly constructs a
-// NEW producer - which bumps the epoch and fences the incumbent - and then
-// ABANDONS the old one without Close(). The old producer's flush loop keeps
-// running with buffered records and a live upload path: a zombie primary that
-// has not yet noticed it lost the log.
-//
-// The porcupine model is unchanged and is exactly the right assertion here: if
-// fencing leaks, a zombie's commit lands out of order or duplicates an id, and
-// no linearization exists.
-//
-// Concurrently a real wal.Replica tails the log and its applied state is
-// checked to be an exact prefix of the committed log at every step.
+// If fencing leaks, a zombie commit lands out of order or duplicates an id and
+// no linearization exists. A real replica tails concurrently.
 func TestFailover_ZombiePrimary(t *testing.T) {
 	for _, seed := range seeds(t) {
 		runFailover(t, seed)

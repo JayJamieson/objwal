@@ -21,11 +21,8 @@ var ErrFenced = errors.New("wal: producer fenced by a newer epoch")
 // commit error, fencing, or Close).
 var ErrHalted = errors.New("wal: producer halted")
 
-// ErrNoRecords is returned by Append when it is given no records. It is
-// rejected at the door rather than admitted, because an empty group produces a
-// zero-record segment whose manifest entry is invalid, and that surfaces as a
-// non-retryable commit error - which would halt the log permanently on behalf
-// of a caller that merely passed an empty slice.
+// ErrNoRecords is returned by Append when given no records. An empty group
+// would produce an invalid manifest entry and halt the producer.
 var ErrNoRecords = errors.New("wal: Append requires at least one record")
 
 const (
@@ -47,11 +44,9 @@ type ProducerConfig struct {
 	FlushBytes int
 	// Compression applied to segment record blocks.
 	Compression Compression
-	// LegacySegmentFormat writes segments in the buffer's unchecksummed
-	// batch-v1 framing instead of v2. Only set this if something downstream
-	// consumes objwal segments as upstream buffer batches; it gives up
-	// corruption detection on the record block. Reading v1 is always
-	// supported regardless.
+	// LegacySegmentFormat writes unchecksummed batch-v1 segments instead of
+	// v2, for downstream consumers that read them as upstream buffer batches.
+	// Gives up corruption detection. Reading v1 is always supported.
 	LegacySegmentFormat bool
 
 	// MaxInFlightBytes caps the total bytes Appended but not yet durably
@@ -96,9 +91,8 @@ type ProducerConfig struct {
 	// (default 100ms).
 	ManifestInitialBackoff time.Duration
 	// MaxCommitConflicts bounds how many times a commit may lose the manifest
-	// CAS race (412) before giving up (default 64). A lost race is normally
-	// resolved by the next load's epoch check turning into ErrFenced; the
-	// bound exists so a misclassified error cannot spin forever.
+	// CAS race (412) before giving up (default 64), so a misclassified error
+	// cannot spin forever.
 	MaxCommitConflicts int
 }
 
@@ -292,12 +286,10 @@ func (p *Producer) Epoch() uint64 { return p.epoch }
 // claim bumps the manifest epoch under CAS, establishing this producer as the
 // current primary.
 //
-// Every failure mode - a lost race, a transient error, or an ambiguous PUT
-// whose response was lost - is handled by the same retry: reload, bump again,
-// re-CAS. That is safe without a claimant identity in the manifest because a
-// claim only ever succeeds on a CAS that returned cleanly, and a retry's
-// higher epoch supersedes any earlier attempt of ours that silently landed.
-// The cost is epoch inflation under flapping, which is free in a uint64.
+// Every failure - lost race, transient error, or an ambiguous PUT whose
+// response was lost - retries the same way: reload, bump, re-CAS. Safe without
+// a claimant identity because a claim only succeeds on a clean CAS, and the
+// retry's higher epoch supersedes any earlier attempt that silently landed.
 func (p *Producer) claim(ctx context.Context) error {
 	bo := newBackoff(p.cfg.ManifestInitialBackoff)
 	var last error
@@ -354,10 +346,8 @@ func (p *Producer) Append(ctx context.Context, records [][]byte, meta []byte) (*
 			p.mu.Unlock()
 			return nil, err
 		}
-		// Close sets closing before it stops the run loop, so a record can
-		// never be admitted to p.pending after the last flush that could
-		// drain it. Without this, Append returns a Durability that nothing
-		// will ever resolve and Wait blocks forever.
+		// Set before the run loop stops, so no record is admitted after the
+		// final drain and left with a Durability nothing resolves.
 		if p.closing {
 			p.mu.Unlock()
 			return nil, ErrHalted
@@ -405,16 +395,11 @@ func (p *Producer) signal(ch chan struct{}) {
 	}
 }
 
-// Close stops the flush loop, drains buffered records, and marks the producer
-// halted so later Appends fail fast.
-// Close stops the flush loop, drains whatever is still buffered, and halts the
-// producer. It is idempotent; subsequent calls return the first call's result.
+// Close stops the flush loop, drains buffered records, and halts the producer
+// so later Appends fail fast. Idempotent; later calls return the first result.
 //
-// Ordering matters. closing is set BEFORE the run loop is stopped, so every
-// admitted record is guaranteed to be in p.pending when the final drain runs.
-// Stopping first would leave a window where an Append still sees halted==nil,
-// admits itself after the last flush, and is orphaned with a Durability that
-// never resolves.
+// closing is set before the run loop stops so every admitted record is in
+// p.pending when the final drain runs.
 func (p *Producer) Close(ctx context.Context) error {
 	p.closeOnce.Do(func() {
 		p.mu.Lock()
@@ -600,10 +585,8 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 	cbo := newBackoff(p.cfg.ManifestInitialBackoff)
 	transient := 0
 	conflicts := 0
-	// unknown is set once a commit attempt returns an error that does NOT
-	// definitively mean "did not land" (a timeout, a reset, a 5xx). From that
-	// point on every attempt must first ask whether the previous PUT actually
-	// landed, or it will append the same entries a second time.
+	// Set once an attempt fails in a way that does not prove the PUT did not
+	// land (timeout, reset, 5xx). After that, every retry must check first.
 	unknown := false
 	for {
 		m, ver, _, err := p.store.Load(ctx)
@@ -620,10 +603,8 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		if m.Epoch() != p.epoch {
 			return nil, ErrFenced
 		}
-		// Idempotency: segment locations are unique per (runID, ordinal), so a
-		// lost response can be resolved by looking for our own entries rather
-		// than re-appending them. All plans in a group land in one CAS, so it
-		// is all-or-nothing.
+		// Segment locations are unique per (runID, ordinal), so a lost
+		// response resolves by lookup rather than re-appending.
 		if unknown {
 			seqs, ok, herr := harvestCommitted(m, plans)
 			if herr != nil {
@@ -641,9 +622,8 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 			}
 			seqs[i] = s
 		}
-		// Fencing is enforced by the CAS ETag; this asserts that the epoch we
-		// are about to write back still agrees, so a broken ETag path cannot
-		// silently disable fencing while the epoch field still looks correct.
+		// Fencing is enforced by the CAS ETag; this keeps the epoch field in
+		// agreement so a broken ETag path cannot silently disable it.
 		if m.Epoch() != p.epoch {
 			return nil, fmt.Errorf("wal: epoch invariant violated: manifest %d, producer %d", m.Epoch(), p.epoch)
 		}
@@ -651,9 +631,7 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		if err == nil {
 			return seqs, nil
 		}
-		// 412: definitively did not land. Someone else advanced the manifest.
-		// Re-plan for free, but bound it and back off: without a bound this
-		// spins only until a competing writer happens to bump the epoch.
+		// 412: definitively did not land. Re-plan, but bounded and backed off.
 		if errors.Is(err, objectstore.ErrPreconditionFailed) {
 			conflicts++
 			if conflicts >= p.cfg.MaxCommitConflicts {
@@ -664,9 +642,8 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 			}
 			continue
 		}
-		// 409 ConditionalRequestConflict: a concurrent conditional write to
-		// the same key was in flight. Did not land; S3 asks us to retry with
-		// backoff. Distinct from 412 so it cannot drive the free re-plan loop.
+		// 409: concurrent conditional write in flight. Did not land; retry
+		// with backoff rather than re-planning.
 		if errors.Is(err, objectstore.ErrConflict) {
 			transient++
 			if transient >= p.cfg.ManifestMaxAttempts {
@@ -689,11 +666,9 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 	}
 }
 
-// harvestCommitted reports whether plans' entries are already present in m
-// (a previous attempt's PUT landed but its response was lost), returning the
-// sequences they were actually assigned. Partial presence is impossible - one
-// CAS carries the whole group - and is treated as a hard error rather than
-// silently re-committing.
+// harvestCommitted reports whether plans' entries are already in m from an
+// attempt whose response was lost, returning their assigned sequences. One CAS
+// carries the whole group, so partial presence is an error, not a re-commit.
 func harvestCommitted(m *Manifest, plans []segPlan) ([]uint64, bool, error) {
 	tail, err := m.TailLocations(len(plans) * 4)
 	if err != nil {

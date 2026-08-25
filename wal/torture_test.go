@@ -29,15 +29,9 @@ func newTestProducer(t *testing.T, store objectstore.ObjectStore, manifest, segP
 	return p
 }
 
-// SUSPECT 1: Append admitted into p.pending after the run loop has exited.
-//
-// Close() does: close(stop); <-stopped; flush(); halt(ErrHalted). An Append
-// that checks p.halted (still nil) and admits itself into p.pending AFTER the
-// final flush has taken the batch is orphaned - the run loop is gone, nothing
-// will ever flush it, and nothing ever fails it.
-//
-// The contract a caller can rely on is that a Durability ALWAYS resolves: to a
-// sequence, or to an error. Blocking forever is neither.
+// A Durability must always resolve, to a sequence or an error. An Append
+// admitted after the final drain has no run loop left to flush it and nothing
+// to fail it, so Wait would block forever.
 func TestCloseRace_DurabilityAlwaysResolves(t *testing.T) {
 	for attempt := 0; attempt < 40; attempt++ {
 		store, keyPrefix := backingStore(t)
@@ -82,13 +76,9 @@ func TestCloseRace_DurabilityAlwaysResolves(t *testing.T) {
 	}
 }
 
-// SUSPECT 2: an Append carrying zero records.
-//
-// planSegments builds a plan whose records slice is empty, encodeSegment
-// happily encodes a zero-record segment, and Manifest.Append rejects count<1
-// as a NON-RETRYABLE error - which commitInOrder surfaces as a fatal commit
-// error, halting the producer permanently. One empty Append would take the
-// whole log down.
+// An empty Append produces a zero-record segment whose manifest entry is
+// invalid, which surfaces as a non-retryable commit error and halts the
+// producer permanently.
 func TestEmptyAppend_DoesNotHaltTheLog(t *testing.T) {
 	ctx := context.Background()
 	store, keyPrefix := backingStore(t)
@@ -119,7 +109,7 @@ func TestEmptyAppend_DoesNotHaltTheLog(t *testing.T) {
 	}
 }
 
-// SUSPECT 3: Close is not idempotent - it closes p.stop unconditionally.
+// Close must be idempotent; it used to close p.stop unconditionally.
 func TestDoubleClose_DoesNotPanic(t *testing.T) {
 	ctx := context.Background()
 	store, keyPrefix := backingStore(t)
@@ -133,12 +123,9 @@ func TestDoubleClose_DoesNotPanic(t *testing.T) {
 	_ = p.Close(ctx)
 }
 
-// SUSPECT 4: multi-record Append sequence arithmetic.
-//
-// Every earlier test used exactly one record per Append, so resolvePlan's
-// baseSeq + StartIndex arithmetic across coalesced groups of DIFFERENT sizes
-// was never exercised. Each group's returned sequence must be the sequence of
-// its own first record, and the ranges must tile without gaps or overlap.
+// Multi-record Append sequence arithmetic: resolvePlan's baseSeq+StartIndex
+// across coalesced groups of differing sizes. Each group's returned sequence
+// must be its own first record, and ranges must tile without gaps or overlap.
 func TestMultiRecordAppend_SequenceArithmetic(t *testing.T) {
 	ctx := context.Background()
 	store, keyPrefix := backingStore(t)
@@ -217,11 +204,7 @@ func TestMultiRecordAppend_SequenceArithmetic(t *testing.T) {
 	}
 }
 
-// SUSPECT 5: replica restart from a persisted cursor.
-//
-// The failover test used a long-lived replica. A replica that CRASHES and
-// resumes from its cursor was never tested, and that is the normal case in
-// production.
+// Replica restart from a persisted cursor - the normal production case.
 func TestReplicaRestart_ResumesExactly(t *testing.T) {
 	ctx := context.Background()
 	store, keyPrefix := backingStore(t)

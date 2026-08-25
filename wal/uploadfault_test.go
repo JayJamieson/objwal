@@ -13,34 +13,23 @@ import (
 	"github.com/JayJamieson/objwal/wal"
 )
 
-// TestUploadFaults targets the path the linearizability harness deliberately
-// avoided: faults on SEGMENT PUTs rather than the manifest CAS.
+// TestUploadFaults injects faults on segment PUTs rather than the manifest CAS.
+// flush() commits only the contiguous successful prefix and halts at the first
+// failed upload, since committing past a gap would reorder the log.
 //
-// flush() uploads segments concurrently, then commits only the contiguous
-// successful PREFIX and halts at the first failed upload, on the grounds that
-// committing past a gap would reorder the log. That reasoning is sound but
-// entirely untested, and it is a path where a mistake silently loses or
-// reorders records.
+// Beyond linearizability:
 //
-// Invariants asserted here, beyond linearizability:
-//
-//	INTEGRITY   every location the manifest commits must actually EXIST in the
-//	            store and decode. A commit that outruns its upload would leave
-//	            a manifest entry pointing at a missing or partial object, which
-//	            is unrecoverable data loss rather than a failed write.
-//	DENSE       committed sequences must be gapless and ascending. The halt-on
-//	            -first-failure rule exists precisely to guarantee this.
-//	ACKED       every Append that returned a sequence must be present in the
-//	            log. A halt may fail pending writes, but never an acked one.
+//	INTEGRITY  every committed location exists in the store and is non-empty
+//	DENSE      committed sequences are gapless and ascending
+//	ACKED      a halt may fail pending writes, never an acked one
 func TestUploadFaults(t *testing.T) {
 	for _, seed := range seeds(t) {
 		runUploadFaults(t, seed, 0.70, 0.0)
 	}
 }
 
-// TestUploadFaults_Ambiguous injects uploads that LAND and then report failure.
-// The producer treats the segment as failed and halts, orphaning an object
-// that is actually complete - wasteful, but it must not be incorrect.
+// TestUploadFaults_Ambiguous: uploads that land and then report failure. The
+// producer halts and orphans a complete object - wasteful, but must be correct.
 func TestUploadFaults_Ambiguous(t *testing.T) {
 	for _, seed := range seeds(t) {
 		runUploadFaults(t, seed, 0.0, 0.70)
