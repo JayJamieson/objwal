@@ -494,3 +494,29 @@ func decodeEntry(data []byte, offset int, hasCount bool) (Entry, int, error) {
 	}
 	return Entry{Sequence: seq, Count: cnt, Location: location, Metadata: md}, end, nil
 }
+
+// TailLocations returns the segment locations of the last `limit` live
+// entries, mapped to their entries. Segment locations are unique per
+// (runID, ordinal), so they are a natural idempotency key: a writer that
+// lost the response to a manifest CAS can ask whether its entries already
+// landed instead of blindly re-appending them.
+//
+// Only the tail is considered because a lost-response re-check is only ever
+// looking for its own just-committed entries, which are necessarily last.
+func (m *Manifest) TailLocations(limit int) (map[string]Entry, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	all, err := m.Entries()
+	if err != nil {
+		return nil, err
+	}
+	if len(all) > limit {
+		all = all[len(all)-limit:]
+	}
+	out := make(map[string]Entry, len(all))
+	for _, e := range all {
+		out[e.Location] = e
+	}
+	return out, nil
+}
