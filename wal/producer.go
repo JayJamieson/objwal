@@ -21,6 +21,13 @@ var ErrFenced = errors.New("wal: producer fenced by a newer epoch")
 // commit error, fencing, or Close).
 var ErrHalted = errors.New("wal: producer halted")
 
+// ErrNoRecords is returned by Append when it is given no records. It is
+// rejected at the door rather than admitted, because an empty group produces a
+// zero-record segment whose manifest entry is invalid, and that surfaces as a
+// non-retryable commit error - which would halt the log permanently on behalf
+// of a caller that merely passed an empty slice.
+var ErrNoRecords = errors.New("wal: Append requires at least one record")
+
 const (
 	defaultMaxInFlightBytes   = 256 << 20 // 256 MiB
 	defaultMaxInFlightBatches = 4096
@@ -245,6 +252,10 @@ type Producer struct {
 	ordinal       uint64
 	halted        error
 
+	closing   bool // Close has begun; admit no more records
+	closeOnce sync.Once
+	closeErr  error
+
 	released  chan struct{} // wakes Append waiters when budget frees
 	uploadSem chan struct{} // bounds concurrent segment uploads within a flush
 	flushNow  chan struct{}
@@ -328,6 +339,9 @@ func (p *Producer) claim(ctx context.Context) error {
 // onto the caller. The returned Durability resolves when the group is
 // committed. Records are not copied; do not mutate them until it resolves.
 func (p *Producer) Append(ctx context.Context, records [][]byte, meta []byte) (*Durability, error) {
+	if len(records) == 0 {
+		return nil, ErrNoRecords
+	}
 	w := newDurability(len(records))
 	b := 0
 	for _, r := range records {
@@ -339,6 +353,14 @@ func (p *Producer) Append(ctx context.Context, records [][]byte, meta []byte) (*
 			err := p.halted
 			p.mu.Unlock()
 			return nil, err
+		}
+		// Close sets closing before it stops the run loop, so a record can
+		// never be admitted to p.pending after the last flush that could
+		// drain it. Without this, Append returns a Durability that nothing
+		// will ever resolve and Wait blocks forever.
+		if p.closing {
+			p.mu.Unlock()
+			return nil, ErrHalted
 		}
 		// Admit if nothing is in flight (so an oversized lone Append can never
 		// deadlock), else require both budgets to have room.
@@ -385,12 +407,26 @@ func (p *Producer) signal(ch chan struct{}) {
 
 // Close stops the flush loop, drains buffered records, and marks the producer
 // halted so later Appends fail fast.
+// Close stops the flush loop, drains whatever is still buffered, and halts the
+// producer. It is idempotent; subsequent calls return the first call's result.
+//
+// Ordering matters. closing is set BEFORE the run loop is stopped, so every
+// admitted record is guaranteed to be in p.pending when the final drain runs.
+// Stopping first would leave a window where an Append still sees halted==nil,
+// admits itself after the last flush, and is orphaned with a Durability that
+// never resolves.
 func (p *Producer) Close(ctx context.Context) error {
-	close(p.stop)
-	<-p.stopped
-	err := p.flush(ctx)
-	p.halt(ErrHalted)
-	return err
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closing = true
+		p.mu.Unlock()
+
+		close(p.stop)
+		<-p.stopped
+		p.closeErr = p.flush(ctx)
+		p.halt(ErrHalted)
+	})
+	return p.closeErr
 }
 
 func (p *Producer) run() {
