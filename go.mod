@@ -3,6 +3,7 @@ module github.com/JayJamieson/objwal
 go 1.25
 
 require (
+	github.com/anishathalye/porcupine v1.3.0
 	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.103.3
