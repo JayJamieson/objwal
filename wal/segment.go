@@ -48,9 +48,12 @@ const (
 	segmentFormatVersion uint16 = 2
 	segmentLegacyVersion uint16 = 1
 	recordLenSize               = 4
+	segmentCompSize             = 1
+	segmentCountSize            = 4
 	segmentCRCSize              = 4
-	segmentFooterSizeV1         = 1 + 4 + 2     // comp u8 + count u32 + version u16
-	segmentFooterSize           = 1 + 4 + 4 + 2 // + crc32c u32
+	segmentVersionSize          = 2
+	segmentFooterSizeV1         = segmentCompSize + segmentCountSize + segmentVersionSize
+	segmentFooterSize           = segmentCompSize + segmentCountSize + segmentCRCSize + segmentVersionSize
 )
 
 // CRC-32C: hardware-accelerated on amd64/arm64 and stronger than IEEE for
@@ -103,7 +106,7 @@ func decodeSegment(data []byte) ([][]byte, error) {
 		return nil, fmt.Errorf("wal: segment too small for footer")
 	}
 	n := len(data)
-	version := binary.LittleEndian.Uint16(data[n-2:])
+	version := binary.LittleEndian.Uint16(data[n-segmentVersionSize:])
 
 	var body []byte
 	var comp Compression
@@ -113,17 +116,19 @@ func decodeSegment(data []byte) ([][]byte, error) {
 		if n < segmentFooterSize {
 			return nil, fmt.Errorf("wal: segment too small for v2 footer")
 		}
-		want := binary.LittleEndian.Uint32(data[n-6 : n-2])
-		covered := data[:n-6]
+		footer := data[n-segmentFooterSize:]
+		want := binary.LittleEndian.Uint32(footer[segmentCompSize+segmentCountSize : segmentCompSize+segmentCountSize+segmentCRCSize])
+		covered := data[:n-segmentCRCSize-segmentVersionSize]
 		if got := crc32.Checksum(covered, castagnoli); got != want {
 			return nil, fmt.Errorf("%w: segment crc32c %08x, stored %08x", ErrCorrupt, got, want)
 		}
-		comp = Compression(data[n-11])
-		count = binary.LittleEndian.Uint32(data[n-10 : n-6])
+		comp = Compression(footer[0])
+		count = binary.LittleEndian.Uint32(footer[segmentCompSize : segmentCompSize+segmentCountSize])
 		body = data[: n-segmentFooterSize : n-segmentFooterSize]
 	case segmentLegacyVersion:
-		comp = Compression(data[n-7])
-		count = binary.LittleEndian.Uint32(data[n-6 : n-2])
+		footer := data[n-segmentFooterSizeV1:]
+		comp = Compression(footer[0])
+		count = binary.LittleEndian.Uint32(footer[segmentCompSize : segmentCompSize+segmentCountSize])
 		body = data[: n-segmentFooterSizeV1 : n-segmentFooterSizeV1]
 	default:
 		return nil, fmt.Errorf("wal: unsupported segment version %d", version)
