@@ -18,18 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// Derived/mostly 1:1 copy from https://github.com/opendata-oss/opendata-go/blob/aa37f43069c2e512981fa63b2ebcbe2f657f82eb/objstore/s3.go
-//
-// S3 is an ObjectStore backed by AWS S3 or an S3-compatible store (MinIO, etc.).
-//
-// Conditional writes rely on S3's If-None-Match / If-Match preconditions:
-// PutCreate sends If-None-Match: "*", PutUpdate sends If-Match: <etag>. These
-// are supported by AWS S3 (since Nov 2024) and by recent MinIO releases; an
-// older S3-compatible store that ignores the preconditions will silently break
-// the CAS protocol, so verify support before relying on it.
-//
-// Adapted from the opendata-go objstore bindings, mapped onto this package's
-// PutOpts / List / ObjectMeta surface.
 // s3API is the narrow subset of the S3 client the adapter uses. *s3.Client
 // satisfies it; tests inject a fake with in-memory conditional-write semantics
 // so the adapter's header-setting and error-mapping are covered without a live
@@ -41,6 +29,15 @@ type s3API interface {
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
+// S3 is an ObjectStore backed by AWS S3 or an S3-compatible store (MinIO,
+// etc.). Adapted from the opendata-go objstore bindings, mapped onto this
+// package's PutOpts / List / ObjectMeta surface.
+//
+// Conditional writes rely on S3's If-None-Match / If-Match preconditions:
+// PutCreate sends If-None-Match: "*", PutUpdate sends If-Match: <etag>. These
+// are supported by AWS S3 (since Nov 2024) and by recent MinIO releases; an
+// older S3-compatible store that ignores the preconditions will silently break
+// the CAS protocol, so verify support before relying on it.
 type S3 struct {
 	client s3API
 	bucket string
@@ -121,7 +118,7 @@ func (s *S3) PutOpts(ctx context.Context, path string, data []byte, opts PutOpti
 	_, err := s.client.PutObject(ctx, input)
 	if err != nil {
 		if isConflict(err) {
-			return fmt.Errorf("%w: %s", ErrConflict, err)
+			return fmt.Errorf("%w: %w", ErrConflict, err)
 		}
 		if isPreconditionFailed(err) {
 			if opts.Mode == PutCreate {

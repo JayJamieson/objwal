@@ -58,8 +58,8 @@ func push(state, id string) string {
 }
 
 var logModel = porcupine.NondeterministicModel{
-	Init: func() []interface{} { return []interface{}{""} },
-	Step: func(st, in, out interface{}) []interface{} {
+	Init: func() []any { return []any{""} },
+	Step: func(st, in, out any) []any {
 		state := st.(string)
 		i := in.(logInput)
 		o := out.(logOutput)
@@ -69,9 +69,9 @@ var logModel = porcupine.NondeterministicModel{
 				// Unknown outcome: it may have landed at the end, or not at
 				// all. It may never have landed twice.
 				if has(state, i.id) {
-					return []interface{}{state}
+					return []any{state}
 				}
-				return []interface{}{state, push(state, i.id)}
+				return []any{state, push(state, i.id)}
 			}
 			// A definite success. Illegal if the id is already committed
 			// (that is the duplicate bug) or if the returned sequence is not
@@ -79,16 +79,16 @@ var logModel = porcupine.NondeterministicModel{
 			if has(state, i.id) || o.seq != uint64(size(state)) {
 				return nil
 			}
-			return []interface{}{push(state, i.id)}
+			return []any{push(state, i.id)}
 		case opRead:
 			if state != o.log {
 				return nil
 			}
-			return []interface{}{state}
+			return []any{state}
 		}
 		return nil
 	},
-	DescribeOperation: func(in, out interface{}) string {
+	DescribeOperation: func(in, out any) string {
 		i := in.(logInput)
 		o := out.(logOutput)
 		if i.op == opRead {
@@ -99,7 +99,7 @@ var logModel = porcupine.NondeterministicModel{
 		}
 		return fmt.Sprintf("append(%s) -> %d", i.id, o.seq)
 	},
-	DescribeState: func(st interface{}) string { return st.(string) },
+	DescribeState: func(st any) string { return st.(string) },
 }
 
 // readLog reads the committed log atomically: one manifest GET, then the
@@ -138,8 +138,10 @@ func (r *recorder) add(client int, in logInput, call int64, out logOutput, ret i
 func now() int64 { return time.Now().UnixNano() }
 
 // runOnce drives concurrent appenders and readers against a producer whose
-// store injects faults on the manifest key, then checks the history.
-func runOnce(t *testing.T, seed uint64, ambiguous, clean float64) {
+// store injects faults on the manifest key, then checks the history. faults
+// is applied as given, except KeySubstring is always pinned to the manifest
+// path - only the CAS path is the subject here, segment PUTs are not.
+func runOnce(t *testing.T, seed uint64, faults objectstore.Faults) {
 	t.Helper()
 	const (
 		clients    = 4
@@ -153,11 +155,8 @@ func runOnce(t *testing.T, seed uint64, ambiguous, clean float64) {
 	defer cancel()
 
 	mem := inner
-	sim := objectstore.NewSimStore(mem, seed, objectstore.Faults{
-		FailAmbiguous: ambiguous,
-		FailClean:     clean,
-		KeySubstring:  manifest, // only the CAS path; segment PUTs are not the subject
-	})
+	faults.KeySubstring = manifest
+	sim := objectstore.NewSimStore(mem, seed, faults)
 
 	p, err := wal.NewProducer(ctx, sim, wal.ProducerConfig{
 		ManifestPath:           manifest,
@@ -241,11 +240,11 @@ func runOnce(t *testing.T, seed uint64, ambiguous, clean float64) {
 	res, info := porcupine.CheckOperationsVerbose(logModel.ToModel(), rec.ops, 20*time.Second)
 	switch res {
 	case porcupine.Ok:
-		t.Logf("seed %d OK: %d ops, %d ambiguous faults, %d clean faults, %d CAS conflicts, log=%d entries",
-			seed, len(rec.ops), st.AmbiguousFaults, st.CleanFaults, st.CASFailures, size(final))
+		t.Logf("seed %d OK: %d ops, %d ambiguous, %d slow, %d clean, %d corrupt reads, %d CAS conflicts, log=%d entries",
+			seed, len(rec.ops), st.AmbiguousFaults, st.SlowFaults, st.CleanFaults, st.CorruptReads, st.CASFailures, size(final))
 	case porcupine.Illegal:
 		if path := os.Getenv("PORCUPINE_VIZ"); path != "" {
-			f, _ := os.Create(path)
+			f, _ := os.Create(path) //nolint:gosec // local debug output path, set by the developer via env var
 			_ = porcupine.Visualize(logModel.ToModel(), info, f)
 			_ = f.Close()
 		}
@@ -278,7 +277,7 @@ func seeds(t *testing.T) []uint64 {
 // TestLinearizable_NoFaults is the control: the happy path must linearize.
 func TestLinearizable_NoFaults(t *testing.T) {
 	for _, s := range seeds(t) {
-		runOnce(t, s, 0, 0)
+		runOnce(t, s, objectstore.Faults{})
 	}
 }
 
@@ -287,13 +286,53 @@ func TestLinearizable_NoFaults(t *testing.T) {
 // entries landed duplicates records, which the model rejects.
 func TestLinearizable_AmbiguousCommits(t *testing.T) {
 	for _, s := range seeds(t) {
-		runOnce(t, s, 0.25, 0)
+		runOnce(t, s, objectstore.Faults{FailAmbiguous: 0.25})
 	}
 }
 
 // TestLinearizable_Mixed adds clean failures, exercising the re-plan path.
 func TestLinearizable_Mixed(t *testing.T) {
 	for _, s := range seeds(t) {
-		runOnce(t, s, 0.35, 0.25)
+		runOnce(t, s, objectstore.Faults{FailAmbiguous: 0.35, FailClean: 0.25})
+	}
+}
+
+// TestLinearizable_SlowAmbiguousCommits: the manifest CAS lands, then the
+// response is slow enough that real wall-clock time passes before it's
+// reported lost - unlike FailAmbiguous, which reports the loss instantly.
+// This gives a concurrent retry (or a rival claimant) a genuine window to run
+// and observe the manifest before the slow caller's PUT is reported failed,
+// which FailAmbiguous's synchronous fault can never produce.
+func TestLinearizable_SlowAmbiguousCommits(t *testing.T) {
+	for _, s := range seeds(t) {
+		runOnce(t, s, objectstore.Faults{
+			SlowAmbiguous: 0.30,
+			SlowDelay:     5 * time.Millisecond,
+			FailClean:     0.10,
+		})
+	}
+}
+
+// TestLinearizable_CorruptReads: manifest GETs occasionally come back with one
+// flipped bit. ParseManifest must reject the digest (ErrCorrupt) rather than
+// decode garbage into a phantom entry, and because the fault is rolled fresh
+// per call, the bounded Load retries in claim/commitEntries must ride through
+// it to a clean read rather than exhausting on transient-looking corruption.
+func TestLinearizable_CorruptReads(t *testing.T) {
+	for _, s := range seeds(t) {
+		runOnce(t, s, objectstore.Faults{Corrupt: 0.20})
+	}
+}
+
+// TestLinearizable_Latency: no failures at all, just real per-call latency on
+// every manifest op. Pins that jittered delay alone - stacked against
+// FlushInterval and the backoff timers - cannot desynchronize the protocol
+// into a non-linearizable history.
+func TestLinearizable_Latency(t *testing.T) {
+	for _, s := range seeds(t) {
+		runOnce(t, s, objectstore.Faults{
+			Latency:       1 * time.Millisecond,
+			LatencyJitter: 800 * time.Microsecond,
+		})
 	}
 }

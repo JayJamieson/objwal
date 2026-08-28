@@ -3,24 +3,15 @@ package objectstore
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"testing"
 
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-// apiErr builds an error shaped the way the SDK actually delivers one: a
-// transport ResponseError wrapping a smithy APIError.
+// apiErr is s3APIError (defined in s3_test.go) with a placeholder message,
+// for cases where classification doesn't depend on the message text.
 func apiErr(status int, code string) error {
-	return fmt.Errorf("operation error S3: PutObject, %w", &awshttp.ResponseError{
-		ResponseError: &smithyhttp.ResponseError{
-			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
-			Err:      &smithy.GenericAPIError{Code: code, Message: "..."},
-		},
-	})
+	return s3APIError(status, code, "...")
 }
 
 func TestClassify(t *testing.T) {
@@ -65,7 +56,7 @@ func TestConflictNotPrecondition(t *testing.T) {
 	if isPreconditionFailed(c) {
 		t.Fatal("409 must not classify as a precondition failure: it would drive the unbounded re-plan loop")
 	}
-	wrapped := fmt.Errorf("%w: %s", ErrConflict, c)
+	wrapped := fmt.Errorf("%w: %w", ErrConflict, c)
 	if !errors.Is(wrapped, ErrConflict) || errors.Is(wrapped, ErrPreconditionFailed) {
 		t.Fatal("ErrConflict must be distinguishable from ErrPreconditionFailed")
 	}

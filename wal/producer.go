@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/JayJamieson/objwal/objectstore"
 	"github.com/oklog/ulid/v2"
@@ -94,6 +97,17 @@ type ProducerConfig struct {
 	// CAS race (412) before giving up (default 64), so a misclassified error
 	// cannot spin forever.
 	MaxCommitConflicts int
+	// Logger receives structured lifecycle events: claims, fencing, commit
+	// retries/conflicts, upload failures, halts. Defaults to a text logger on
+	// stderr filtered to Warn, so a healthy producer is silent; pass your own
+	// *slog.Logger (any handler, any level, including Debug/Info for routine
+	// flow) to change verbosity or destination.
+	Logger *slog.Logger
+	// Meter records batch/commit/retry/fencing metrics (see producerMetrics).
+	// Defaults to otel.GetMeterProvider()'s meter, which is a no-op until the
+	// process calls otel.SetMeterProvider - so metrics cost nothing unless
+	// wired up, here or globally.
+	Meter metric.Meter
 }
 
 func (c *ProducerConfig) withDefaults() {
@@ -126,6 +140,9 @@ func (c *ProducerConfig) withDefaults() {
 	}
 	if c.MaxCommitConflicts <= 0 {
 		c.MaxCommitConflicts = 64
+	}
+	if c.Logger == nil {
+		c.Logger = defaultLogger()
 	}
 }
 
@@ -230,10 +247,12 @@ type segPlan struct {
 // records, group-commits them into segment objects, and CAS-appends manifest
 // entries. It knows nothing about record contents.
 type Producer struct {
-	store *Store
-	os    objectstore.ObjectStore
-	cfg   ProducerConfig
-	now   func() time.Time
+	store   *Store
+	os      objectstore.ObjectStore
+	cfg     ProducerConfig
+	now     func() time.Time
+	log     *slog.Logger
+	metrics *producerMetrics
 
 	epoch uint64
 	runID string
@@ -261,12 +280,16 @@ type Producer struct {
 // epoch. A successful return means this node owns the log at its claimed epoch.
 func NewProducer(ctx context.Context, os objectstore.ObjectStore, cfg ProducerConfig) (*Producer, error) {
 	cfg.withDefaults()
+	runID := ulid.Make().String()
+	log := cfg.Logger.With("wal_manifest", cfg.ManifestPath, "wal_run_id", runID)
 	p := &Producer{
 		store:     NewStore(os, cfg.ManifestPath),
 		os:        os,
 		cfg:       cfg,
 		now:       time.Now,
-		runID:     ulid.Make().String(),
+		log:       log,
+		metrics:   newProducerMetrics(log, cfg.Meter),
+		runID:     runID,
 		released:  make(chan struct{}, 1),
 		uploadSem: make(chan struct{}, cfg.UploadConcurrency),
 		flushNow:  make(chan struct{}, 1),
@@ -276,6 +299,7 @@ func NewProducer(ctx context.Context, os objectstore.ObjectStore, cfg ProducerCo
 	if err := p.claim(ctx); err != nil {
 		return nil, err
 	}
+	//nolint:gosec // run() is a background loop scoped to Close(), not to NewProducer's ctx
 	go p.run()
 	return p, nil
 }
@@ -312,16 +336,22 @@ func (p *Producer) claim(ctx context.Context) error {
 		}
 		if cErr == nil {
 			p.epoch = myEpoch
+			p.log.Info("claimed epoch", "epoch", myEpoch, "attempt", attempt)
+			p.metrics.claims.Add(ctx, 1, metric.WithAttributes(attrOutcomeOK))
 			return nil
 		}
 		last = fmt.Errorf("wal: claim commit: %w", cErr)
+		p.metrics.claimRetries.Add(ctx, 1)
 		// A lost race is a free immediate re-plan; anything else backs off.
 		if !errors.Is(cErr, objectstore.ErrPreconditionFailed) && !errors.Is(cErr, objectstore.ErrAlreadyExists) {
+			p.log.Warn("claim commit failed, backing off", "attempt", attempt, "err", cErr)
 			if serr := bo.sleep(ctx); serr != nil {
 				return serr
 			}
 		}
 	}
+	p.log.Error("claim exhausted attempts", "attempts", p.cfg.MaxClaimAttempts, "err", last)
+	p.metrics.claims.Add(ctx, 1, metric.WithAttributes(attrOutcomeError))
 	return fmt.Errorf("wal: claim exceeded %d attempts: %w", p.cfg.MaxClaimAttempts, last)
 }
 
@@ -370,6 +400,8 @@ func (p *Producer) Append(ctx context.Context, records [][]byte, meta []byte) (*
 			if room {
 				p.signal(p.released) // baton: wake the next waiter if budget remains
 			}
+			p.metrics.appendRecords.Add(ctx, int64(len(records)))
+			p.metrics.appendBytes.Add(ctx, int64(b))
 			return w, nil
 		}
 		p.mu.Unlock()
@@ -513,12 +545,14 @@ func (p *Producer) flush(ctx context.Context) error {
 		// (typically after failover to a fresh producer at a new epoch).
 		uerr := fmt.Errorf("wal: segment upload failed at ordinal %d after %d attempts, halting to preserve log order: %w",
 			base+uint64(firstFail), p.cfg.UploadMaxAttempts, results[firstFail])
+		p.metrics.uploadFailures.Add(ctx, 1)
 		p.halt(uerr)
 		for _, pl := range plans[firstFail:] {
 			p.failItems(pl.items, uerr)
 		}
 		return uerr
 	}
+	p.log.Debug("flush committed", "segments", len(plans), "records", len(batch))
 	return nil
 }
 
@@ -542,6 +576,8 @@ func (p *Producer) commitInOrder(ctx context.Context, plans []segPlan) (int, err
 		}
 		for gi, pl := range group {
 			p.resolvePlan(pl, seqs[gi])
+			p.metrics.batchRecords.Record(ctx, int64(len(pl.records)))
+			p.metrics.batchBytes.Record(ctx, int64(pl.bytes))
 		}
 		i = end
 	}
@@ -580,7 +616,16 @@ func (p *Producer) planSegments(batch []pendingItem) []segPlan {
 // commitEntries CAS-appends every plan's entry in a single manifest commit,
 // returning the assigned sequences aligned to plans. Retry/precondition/fencing
 // semantics match the single-entry path.
-func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64, error) {
+func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) (seqs []uint64, err error) {
+	start := p.now()
+	defer func() {
+		p.metrics.commitDuration.Record(ctx, p.now().Sub(start).Seconds())
+		outcome := attrOutcomeOK
+		if err != nil {
+			outcome = attrOutcomeError
+		}
+		p.metrics.commits.Add(ctx, 1, metric.WithAttributes(outcome))
+	}()
 	bo := newBackoff(p.cfg.ManifestInitialBackoff)
 	cbo := newBackoff(p.cfg.ManifestInitialBackoff)
 	transient := 0
@@ -592,7 +637,9 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		m, ver, _, err := p.store.Load(ctx)
 		if err != nil {
 			transient++
+			p.metrics.commitRetries.Add(ctx, 1, metric.WithAttributes(attrReasonLoad))
 			if transient >= p.cfg.ManifestMaxAttempts {
+				p.log.Warn("commit exhausted attempts loading the manifest", "attempts", transient, "err", err)
 				return nil, fmt.Errorf("wal: commit load after %d attempts: %w", transient, err)
 			}
 			if serr := bo.sleep(ctx); serr != nil {
@@ -601,6 +648,8 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 			continue
 		}
 		if m.Epoch() != p.epoch {
+			p.log.Warn("producer fenced", "manifest_epoch", m.Epoch(), "producer_epoch", p.epoch)
+			p.metrics.fenced.Add(ctx, 1)
 			return nil, ErrFenced
 		}
 		// Segment locations are unique per (runID, ordinal), so a lost
@@ -608,9 +657,11 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		if unknown {
 			seqs, ok, herr := harvestCommitted(m, plans)
 			if herr != nil {
+				p.log.Error("commit group partially present in manifest", "err", herr)
 				return nil, herr
 			}
 			if ok {
+				p.log.Info("ambiguous commit resolved: entries already landed", "sequences", seqs)
 				return seqs, nil
 			}
 		}
@@ -625,6 +676,7 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		// Fencing is enforced by the CAS ETag; this keeps the epoch field in
 		// agreement so a broken ETag path cannot silently disable it.
 		if m.Epoch() != p.epoch {
+			p.log.Error("epoch invariant violated", "manifest_epoch", m.Epoch(), "producer_epoch", p.epoch)
 			return nil, fmt.Errorf("wal: epoch invariant violated: manifest %d, producer %d", m.Epoch(), p.epoch)
 		}
 		err = p.store.Commit(ctx, m, ver)
@@ -634,7 +686,9 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		// 412: definitively did not land. Re-plan, but bounded and backed off.
 		if errors.Is(err, objectstore.ErrPreconditionFailed) {
 			conflicts++
+			p.metrics.commitRetries.Add(ctx, 1, metric.WithAttributes(attrReasonCASConflict))
 			if conflicts >= p.cfg.MaxCommitConflicts {
+				p.log.Warn("commit exhausted CAS conflict budget", "conflicts", conflicts)
 				return nil, fmt.Errorf("wal: commit lost %d CAS races (contended)", conflicts)
 			}
 			if serr := cbo.sleep(ctx); serr != nil {
@@ -646,7 +700,9 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		// with backoff rather than re-planning.
 		if errors.Is(err, objectstore.ErrConflict) {
 			transient++
+			p.metrics.commitRetries.Add(ctx, 1, metric.WithAttributes(attrReasonWriteConflict))
 			if transient >= p.cfg.ManifestMaxAttempts {
+				p.log.Warn("commit exhausted attempts on repeated conflict", "attempts", transient, "err", err)
 				return nil, fmt.Errorf("wal: commit conflict after %d attempts: %w", transient, err)
 			}
 			if serr := bo.sleep(ctx); serr != nil {
@@ -657,7 +713,9 @@ func (p *Producer) commitEntries(ctx context.Context, plans []segPlan) ([]uint64
 		// Anything else: outcome unknown. The PUT may have landed.
 		unknown = true
 		transient++
+		p.metrics.commitRetries.Add(ctx, 1, metric.WithAttributes(attrReasonUnknown))
 		if transient >= p.cfg.ManifestMaxAttempts {
+			p.log.Warn("commit exhausted attempts, outcome unknown", "attempts", transient, "err", err)
 			return nil, fmt.Errorf("wal: commit after %d attempts: %w", transient, err)
 		}
 		if serr := bo.sleep(ctx); serr != nil {
@@ -729,16 +787,6 @@ func (p *Producer) resolvePlan(pl segPlan, baseSeq uint64) {
 	p.release(b, c)
 }
 
-func (p *Producer) resolveItems(items []pendingItem, seq uint64) {
-	var b, c int
-	for _, it := range items {
-		it.w.resolve(seq, nil)
-		b += it.bytes
-		c++
-	}
-	p.release(b, c)
-}
-
 func (p *Producer) failItems(items []pendingItem, err error) {
 	var b, c int
 	for _, it := range items {
@@ -751,10 +799,21 @@ func (p *Producer) failItems(items []pendingItem, err error) {
 
 func (p *Producer) halt(err error) {
 	p.mu.Lock()
-	if p.halted == nil {
+	first := p.halted == nil
+	if first {
 		p.halted = err
 	}
 	p.mu.Unlock()
+	if !first {
+		return
+	}
+	if errors.Is(err, ErrHalted) {
+		p.log.Info("producer closed")
+		p.metrics.halted.Add(context.Background(), 1, metric.WithAttributes(attrOutcomeOK))
+		return
+	}
+	p.log.Error("producer halted", "err", err)
+	p.metrics.halted.Add(context.Background(), 1, metric.WithAttributes(attrOutcomeError))
 }
 
 const maxBackoff = 5 * time.Second

@@ -71,7 +71,7 @@ func (f *FileCursorStore) Save(_ context.Context, next uint64) error {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], next)
 	tmp := f.path + ".tmp"
-	if err := os.WriteFile(tmp, buf[:], 0o644); err != nil {
+	if err := os.WriteFile(tmp, buf[:], 0o600); err != nil {
 		return fmt.Errorf("wal: cursor save (tmp): %w", err)
 	}
 	if err := os.Rename(tmp, f.path); err != nil {

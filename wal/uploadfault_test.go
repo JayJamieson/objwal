@@ -24,7 +24,7 @@ import (
 //	ACKED      a halt may fail pending writes, never an acked one
 func TestUploadFaults(t *testing.T) {
 	for _, seed := range seeds(t) {
-		runUploadFaults(t, seed, 0.70, 0.0)
+		runUploadFaults(t, seed, 0.70, 0.0, objectstore.Faults{})
 	}
 }
 
@@ -32,11 +32,30 @@ func TestUploadFaults(t *testing.T) {
 // producer halts and orphans a complete object - wasteful, but must be correct.
 func TestUploadFaults_Ambiguous(t *testing.T) {
 	for _, seed := range seeds(t) {
-		runUploadFaults(t, seed, 0.0, 0.70)
+		runUploadFaults(t, seed, 0.0, 0.70, objectstore.Faults{})
 	}
 }
 
-func runUploadFaults(t *testing.T, seed uint64, clean, ambiguous float64) {
+// TestUploadFaults_WithManifestChaos combines the upload-halt path with faults
+// on the manifest CAS at the same time - segments and manifest fail
+// independently rather than the manifest being kept deliberately healthy, as
+// the other TestUploadFaults* cases do to attribute failures to one path. A
+// halt can now be triggered by either domain (or both, racing), and the
+// commit that follows a halted upload may itself hit an ambiguous or slow
+// manifest PUT: the INTEGRITY/DENSE/ACKED invariants must hold regardless of
+// which domain, or combination, produced the halt.
+func TestUploadFaults_WithManifestChaos(t *testing.T) {
+	for _, seed := range seeds(t) {
+		runUploadFaults(t, seed, 0.35, 0.35, objectstore.Faults{
+			FailAmbiguous: 0.20,
+			SlowAmbiguous: 0.15,
+			SlowDelay:     3 * time.Millisecond,
+			FailClean:     0.10,
+		})
+	}
+}
+
+func runUploadFaults(t *testing.T, seed uint64, clean, ambiguous float64, manifestFaults objectstore.Faults) {
 	t.Helper()
 	const (
 		clients   = 3
@@ -49,16 +68,25 @@ func runUploadFaults(t *testing.T, seed uint64, clean, ambiguous float64) {
 	manifest := keyPrefix + "wal/manifest"
 	segPrefix := keyPrefix + "wal/seg"
 
-	// Faults on the SEGMENT prefix only; the manifest CAS is left healthy so
-	// any failure here is attributable to the upload path.
+	// Faults on the SEGMENT prefix; the manifest CAS is layered separately
+	// below so each domain's fault rate is independently controllable (and,
+	// by default in the other TestUploadFaults* cases, the manifest layer is
+	// simply omitted, leaving the manifest healthy as before).
 	sim := objectstore.NewSimStore(inner, seed, objectstore.Faults{
 		FailClean:     clean,
 		FailAmbiguous: ambiguous,
 		KeySubstring:  "wal/seg",
 	})
+	var store objectstore.ObjectStore = sim
+	var manifestSim *objectstore.SimStore
+	if manifestFaults != (objectstore.Faults{}) {
+		manifestFaults.KeySubstring = "wal/manifest"
+		manifestSim = objectstore.NewSimStore(sim, seed^0x9E3779B97F4A7C15, manifestFaults)
+		store = manifestSim
+	}
 
 	newProducer := func() (*wal.Producer, error) {
-		return wal.NewProducer(ctx, sim, wal.ProducerConfig{
+		return wal.NewProducer(ctx, store, wal.ProducerConfig{
 			ManifestPath:            manifest,
 			SegmentPrefix:           segPrefix,
 			FlushInterval:           2 * time.Millisecond,
@@ -176,11 +204,19 @@ func runUploadFaults(t *testing.T, seed uint64, clean, ambiguous float64) {
 		t.Fatalf("seed %d: NOT LINEARIZABLE under upload faults\n  log: %s", seed, committed)
 	}
 	st := sim.Stats()
-	// Refuse to pass vacuously: if no upload ever exhausted its retries, the
+	// Refuse to pass if no upload ever exhausted its retries, the
 	// halt-and-commit-only-the-prefix path under test never ran.
 	if len(producers) == 1 {
 		t.Fatalf("seed %d: no producer halted - the upload failure path was never exercised (%d clean/%d ambiguous faults injected, but retries absorbed them all)",
 			seed, st.CleanFaults, st.AmbiguousFaults)
+	}
+	if manifestSim != nil {
+		mst := manifestSim.Stats()
+		t.Logf("seed %d OK: %d acked, log=%d, %d producers (%d halts), %d clean/%d ambiguous upload faults, "+
+			"%d clean/%d ambiguous/%d slow manifest faults, %d orphaned segments",
+			seed, len(acked), size(committed), len(producers), len(producers)-1,
+			st.CleanFaults, st.AmbiguousFaults, mst.CleanFaults, mst.AmbiguousFaults, mst.SlowFaults, orphans)
+		return
 	}
 	t.Logf("seed %d OK: %d acked, log=%d, %d producers (%d halts), %d clean/%d ambiguous upload faults, %d orphaned segments",
 		seed, len(acked), size(committed), len(producers), len(producers)-1,

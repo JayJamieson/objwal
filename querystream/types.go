@@ -115,11 +115,11 @@ func (JSONLEncoder[T]) Ext() string { return ".jsonl" }
 
 // Encode implements Encoder.
 func (JSONLEncoder[T]) Encode(path string, seqs []uint64, rows []T) error {
-	f, err := os.Create(path)
+	f, err := os.Create(path) //nolint:gosec // path is the encoder's own API surface, not attacker input
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w := bufio.NewWriter(f)
 	enc := json.NewEncoder(w)
 	for i := range rows {

@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - unconvert
+    - unparam
+    - misspell
+    - gosec
+
+  settings:
+    gosec:
+      excludes:
+        - G404 # math/rand use is deliberate (seeded DST fault injection, not crypto)
+        - G115 # this package is wire-format binary encode/decode; every int<->uintN
+               # conversion sits next to an explicit math.MaxUintN bounds check, which
+               # G115 can't see - it would otherwise fire on nearly every line of
+               # manifest.go/segment.go/producer.go.
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

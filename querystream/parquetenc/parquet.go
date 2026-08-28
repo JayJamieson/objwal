@@ -77,11 +77,11 @@ func (e *Encoder[T]) Ext() string { return ".parquet" }
 // accepted for interface symmetry; the seq value is expected to live in each
 // row's seq-tagged field, which the sink populated.
 func (e *Encoder[T]) Encode(path string, seqs []uint64, rows []T) error {
-	f, err := os.Create(path)
+	f, err := os.Create(path) //nolint:gosec // path is the Encoder's own API surface, not attacker input
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	opts := []parquet.WriterOption{
 		parquet.Compression(e.codec),
@@ -95,7 +95,7 @@ func (e *Encoder[T]) Encode(path string, seqs []uint64, rows []T) error {
 
 	w := parquet.NewGenericWriter[T](f, opts...)
 	if _, err := w.Write(rows); err != nil {
-		w.Close()
+		_ = w.Close()
 		return fmt.Errorf("parquetenc: write %d rows: %w", len(rows), err)
 	}
 	if err := w.Close(); err != nil {

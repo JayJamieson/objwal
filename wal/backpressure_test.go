@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -39,7 +40,7 @@ func TestBackpressureBlocksThenReleases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.Close(ctx) // gate is closed in the body below; Close's flush passes through
+	defer func() { _ = p.Close(ctx) }() // gate is closed in the body below; Close's flush passes through
 
 	// First Append fits (nothing in flight) and triggers a flush that blocks
 	// on the gated segment Put, so its budget stays held.
@@ -103,7 +104,7 @@ func TestBackpressureCancelledWhileBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { close(gate.release); p.Close(context.Background()) }()
+	defer func() { close(gate.release); _ = p.Close(context.Background()) }()
 
 	if _, err := p.Append(context.Background(), [][]byte{[]byte("AAAA")}, nil); err != nil {
 		t.Fatal(err)
@@ -120,7 +121,7 @@ func TestBackpressureCancelledWhileBlocked(t *testing.T) {
 	cancel()
 	select {
 	case err := <-errc:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("blocked Append should return context.Canceled, got %v", err)
 		}
 	case <-time.After(time.Second):
@@ -141,7 +142,7 @@ func TestBackpressureCountCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { close(gate.release); p.Close(context.Background()) }()
+	defer func() { close(gate.release); _ = p.Close(context.Background()) }()
 
 	if _, err := p.Append(context.Background(), [][]byte{[]byte("x")}, nil); err != nil {
 		t.Fatal(err)

@@ -48,7 +48,7 @@ func (o *prefixOracle) snapshot() (string, error) {
 	return s, o.err
 }
 
-func errAt(f string, a ...interface{}) error { return fmt.Errorf(f, a...) }
+func errAt(f string, a ...any) error { return fmt.Errorf(f, a...) }
 
 // TestFailover_ZombiePrimary tests fencing. Appenders write continuously while
 // a chaos goroutine constructs a new producer - bumping the epoch and fencing
