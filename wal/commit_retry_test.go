@@ -53,7 +53,7 @@ func TestManifestCommitRetrySucceeds(t *testing.T) {
 	// start failing once the producer is up: set failOpts after construction.
 	flaky := &commitFlakyStore{ObjectStore: objectstore.NewInMemory()}
 	p := newCommitFlakyProducer(t, flaky, 6)
-	defer p.Close(ctx)
+	defer func() { _ = p.Close(ctx) }()
 
 	flaky.mu.Lock()
 	flaky.failOpts = flaky.seen + 2 // fail the next 2 commit attempts
@@ -81,7 +81,7 @@ func TestManifestCommitExhaustionHaltsProducer(t *testing.T) {
 	ctx := context.Background()
 	flaky := &commitFlakyStore{ObjectStore: objectstore.NewInMemory()}
 	p := newCommitFlakyProducer(t, flaky, 3)
-	defer p.Close(ctx)
+	defer func() { _ = p.Close(ctx) }()
 
 	flaky.mu.Lock()
 	flaky.failOpts = flaky.seen + 1000 // commits never succeed from here
@@ -95,12 +95,11 @@ func TestManifestCommitExhaustionHaltsProducer(t *testing.T) {
 		t.Fatal("expected commit exhaustion to fail the batch")
 	}
 
-	// After a commit exhaustion the producer is halted: later Appends fail fast.
+	// After a commit exhaustion the producer is halted: later Appends fail
+	// fast. The error may be ErrHalted (the pre-check) or the underlying
+	// commit error that caused the halt; either way it must be non-nil.
 	if _, err := p.Append(ctx, [][]byte{[]byte("after-halt")}, nil); err == nil {
 		t.Fatal("expected Append to fail on a halted producer")
-	} else if !errors.Is(err, ErrHalted) && !isWrapped(err, ErrHalted) {
-		// The halt error is the underlying commit error; ErrHalted is what the
-		// pre-check returns. Either way Append must return non-nil here.
 	}
 }
 
@@ -119,13 +118,13 @@ func TestBatchedCursorSaves(t *testing.T) {
 	ctx := context.Background()
 	os := objectstore.NewInMemory()
 	p := newProducer(t, os)
-	for i := 0; i < 5; i++ { // 5 single-record segments => seqs 0..4
-		d, _ := p.Append(ctx, [][]byte{[]byte{byte('a' + i)}}, nil)
+	for i := range 5 { // 5 single-record segments => seqs 0..4
+		d, _ := p.Append(ctx, [][]byte{{byte('a' + i)}}, nil)
 		if _, err := d.Wait(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	p.Close(ctx)
+	_ = p.Close(ctx)
 
 	cc := &countingCursor{}
 	app := &recordingApplier{}
@@ -155,13 +154,13 @@ func TestBatchedCursorResumesCorrectly(t *testing.T) {
 	ctx := context.Background()
 	os := objectstore.NewInMemory()
 	p := newProducer(t, os)
-	for i := 0; i < 4; i++ {
-		d, _ := p.Append(ctx, [][]byte{[]byte{byte('0' + i)}}, nil)
+	for i := range 4 {
+		d, _ := p.Append(ctx, [][]byte{{byte('0' + i)}}, nil)
 		if _, err := d.Wait(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	p.Close(ctx)
+	_ = p.Close(ctx)
 
 	cs := NewFileCursorStore(filepath.Join(t.TempDir(), "cursor"))
 	// Apply all with a wide interval; end-of-poll save still persists next=4.

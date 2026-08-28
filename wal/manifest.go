@@ -136,10 +136,6 @@ type Manifest struct {
 // NewManifest returns an empty manifest at epoch 0 with no snapshot.
 func NewManifest() *Manifest { return &Manifest{} }
 
-// ParseManifest decodes a serialized manifest. It accepts v4 (this package),
-// v3, v2 and v1. Legacy (v1/v2) entries are normalized in memory to the v3
-// encoding with Count==0, so downstream decoding is uniform; a re-commit
-// upgrades the object to v4.
 // coreFooter returns the size of the trailing core block for a footer
 // version. v4 carries a crc32c that the earlier versions do not.
 func coreFooter(version uint16) int {
@@ -149,6 +145,10 @@ func coreFooter(version uint16) int {
 	return coreFooterSize
 }
 
+// ParseManifest decodes a serialized manifest. It accepts v4 (this package),
+// v3, v2 and v1. Legacy (v1/v2) entries are normalized in memory to the v3
+// encoding with Count==0, so downstream decoding is uniform; a re-commit
+// upgrades the object to v4.
 func ParseManifest(data []byte) (*Manifest, error) {
 	if len(data) < coreFooterSize {
 		return nil, fmt.Errorf("wal: manifest too short for footer (%d bytes)", len(data))
@@ -242,7 +242,7 @@ func upgradeLegacyEntries(base []byte, count int) ([]byte, error) {
 	return out, nil
 }
 
-// Bytes serializes the manifest in v3 form.
+// Bytes serializes the manifest in v4 form.
 func (m *Manifest) Bytes() ([]byte, error) {
 	total := m.baseCount + m.appendedCount
 	if total > math.MaxUint32 {

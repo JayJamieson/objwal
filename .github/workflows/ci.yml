@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Root module only (github.com/JayJamieson/objwal): wal, objectstore,
+# querystream, querystream/parquetenc, cmd/s3bench. querystream/duckdbq and
+# cmd/stream are separate Go modules (they pull in CGO + a duckdb toolchain)
+# and are intentionally not covered here - see their own directories.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  # Real conditional-write semantics, not the in-memory store: this is the
+  # thing most likely to diverge from fakeS3 in objectstore's own unit tests
+  # (real error shapes, real 409/412 behavior). Tests that call backingStore
+  # (wal/dststore_test.go) pick up MinIO via OBJWAL_TEST_ENDPOINT; the rest
+  # run against the in-memory store exactly as they do in the `test` job.
+  # DST_SEEDS is trimmed from the package default (12) since each seed now
+  # costs a real network round trip per store call.
+  test-minio:
+    name: test (real S3 / MinIO)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      OBJWAL_TEST_ENDPOINT: http://127.0.0.1:9000
+      OBJWAL_TEST_BUCKET: objwal-ci
+      DST_SEEDS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Image pin matches scripts/test.sh's MINIO_IMAGE; keep them in sync.
+      - name: start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER="${AWS_ACCESS_KEY_ID}" \
+            -e MINIO_ROOT_PASSWORD="${AWS_SECRET_ACCESS_KEY}" \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+
+      - name: wait for MinIO
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "${OBJWAL_TEST_ENDPOINT}/minio/health/live" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time" >&2
+          docker logs minio || true
+          exit 1
+
+      - name: create bucket
+        run: aws --endpoint-url "${OBJWAL_TEST_ENDPOINT}" s3 mb "s3://${OBJWAL_TEST_BUCKET}"
+
+      - name: test against MinIO (race)
+        run: go test -race -count=1 ./wal/... ./objectstore/...
+
+      - name: stop MinIO
+        if: always()
+        run: docker rm -f minio

@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -63,7 +64,7 @@ func TestProduceThenTail(t *testing.T) {
 	ctx := context.Background()
 	os := objectstore.NewInMemory()
 	p := newProducer(t, os)
-	defer p.Close(ctx)
+	defer func() { _ = p.Close(ctx) }()
 
 	want := []string{"put:a=1", "put:b=2", "del:a"}
 	for _, w := range want {
@@ -178,7 +179,7 @@ func TestEpochFencingOnFailover(t *testing.T) {
 	dA, _ := primaryA.Append(ctx, [][]byte{[]byte("from-A-zombie")}, nil)
 	if _, err := dA.Wait(ctx); err == nil {
 		t.Fatal("expected fenced producer A write to fail")
-	} else if err != ErrFenced && !isWrapped(err, ErrFenced) {
+	} else if !errors.Is(err, ErrFenced) {
 		t.Fatalf("expected ErrFenced, got %v", err)
 	}
 
@@ -187,7 +188,7 @@ func TestEpochFencingOnFailover(t *testing.T) {
 	if _, err := dB.Wait(ctx); err != nil {
 		t.Fatalf("B's write should succeed: %v", err)
 	}
-	primaryB.Close(ctx)
+	_ = primaryB.Close(ctx)
 
 	// The replica sees A's first write and B's write, but never the zombie.
 	app := &recordingApplier{}
@@ -217,7 +218,7 @@ func TestApplyFailureCausesIdempotentReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	p.Close(ctx)
+	_ = p.Close(ctx)
 
 	// Fail on the 2nd apply once; the cursor must not have advanced past the
 	// failing segment, so a re-poll re-delivers it.
@@ -230,8 +231,8 @@ func TestApplyFailureCausesIdempotentReplay(t *testing.T) {
 	if _, err := r.Poll(ctx); err != nil {
 		t.Fatalf("second poll should succeed: %v", err)
 	}
-	if r.Next() <= cursorAfterFail && cursorAfterFail != 0 {
-		// cursor should now be at the final sequence
+	if cursorAfterFail != 0 && r.Next() <= cursorAfterFail {
+		t.Fatalf("cursor did not advance past the retried segment: still at %d", r.Next())
 	}
 	// All three eventually applied, in order, with the failed one re-delivered.
 	got := app.datas()
@@ -244,19 +245,4 @@ func TestApplyFailureCausesIdempotentReplay(t *testing.T) {
 			t.Fatalf("record %d = %q, want %q", i, got[i], want[i])
 		}
 	}
-}
-
-func isWrapped(err, target error) bool {
-	for err != nil {
-		if err == target {
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }

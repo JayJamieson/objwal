@@ -100,7 +100,7 @@ func TestTypedApplierDrivesExternalEngine(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	p.Close(ctx)
+	_ = p.Close(ctx)
 
 	// The engine (fakeKV) is entirely external; wal only runs decode + handle.
 	db := newFakeKV()
@@ -179,7 +179,7 @@ func TestReplicaResumesFromPersistedCursor(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	p.Close(ctx)
+	_ = p.Close(ctx)
 
 	cursorPath := filepath.Join(t.TempDir(), "cursor")
 	cs := NewFileCursorStore(cursorPath)
@@ -227,7 +227,7 @@ func TestReplicaMaxRecordsPerPoll(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	p.Close(ctx)
+	_ = p.Close(ctx)
 
 	app := &recordingApplier{}
 	r := NewReplica(os, app, ReplicaConfig{ManifestPath: testManifest, MaxRecordsPerPoll: 2})
@@ -292,7 +292,7 @@ func TestSegmentUploadRetrySucceeds(t *testing.T) {
 	ctx := context.Background()
 	flaky := &flakyStore{ObjectStore: objectstore.NewInMemory(), failPuts: 2}
 	p := newFlakyProducer(t, flaky, 6)
-	defer p.Close(ctx)
+	defer func() { _ = p.Close(ctx) }()
 
 	d, err := p.Append(ctx, [][]byte{[]byte("survives-flakes")}, nil)
 	if err != nil {
@@ -317,7 +317,7 @@ func TestSegmentUploadRetryExhausts(t *testing.T) {
 	// Fail more times than the attempt budget => the batch fails permanently.
 	flaky := &flakyStore{ObjectStore: objectstore.NewInMemory(), failPuts: 100}
 	p := newFlakyProducer(t, flaky, 3)
-	defer p.Close(ctx)
+	defer func() { _ = p.Close(ctx) }()
 
 	d, err := p.Append(ctx, [][]byte{[]byte("never-lands")}, nil)
 	if err != nil {
