@@ -58,7 +58,7 @@ func NewSink[T any](cfg Config, decode Decoder[T], enc Encoder[T]) (*Sink[T], er
 		return nil, fmt.Errorf("querystream: Decoder and Encoder are required")
 	}
 	cfg.withDefaults()
-	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.Dir, 0o750); err != nil {
 		return nil, fmt.Errorf("querystream: create dir: %w", err)
 	}
 
@@ -211,12 +211,12 @@ func (s *Sink[T]) flushOne(ctx context.Context) (bool, error) {
 }
 
 func (s *Sink[T]) writeAtomic(path string, seqs []uint64, rows []T) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
 	if err := s.enc.Encode(tmp, seqs, rows); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)

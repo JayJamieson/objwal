@@ -1,0 +1,81 @@
+name: Release
+
+# Manual by design: a human decides "this is v0.1.0" and pushes the tag.
+# Everything after that - re-verifying the tagged commit, building binaries,
+# publishing the GitHub Release - is automated from here.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  # Re-run the fast checks against the exact tagged commit rather than trusting
+  # that it went through CI as part of a PR - a tag can point at any commit.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+  release:
+    name: release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # cmd/s3bench is pure Go (no cgo) so these cross-compile directly; no
+      # per-target toolchain needed. windows isn't built - add a target here
+      # if that's ever needed.
+      - name: build cmd/s3bench binaries
+        run: |
+          mkdir -p dist
+          version="${GITHUB_REF_NAME}"
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            name="s3bench-${version}-${goos}-${goarch}"
+            mkdir -p "dist/${name}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -o "dist/${name}/s3bench" ./cmd/s3bench
+            cp README.md LICENSE "dist/${name}/"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            rm -rf "dist/${name}"
+          done
+          ( cd dist && sha256sum *.tar.gz > checksums.txt )
+
+      - name: publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*.tar.gz dist/checksums.txt

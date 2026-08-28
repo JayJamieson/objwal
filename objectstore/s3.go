@@ -4,27 +4,20 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
+
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// Derived/mostly 1:1 copy from https://github.com/opendata-oss/opendata-go/blob/aa37f43069c2e512981fa63b2ebcbe2f657f82eb/objstore/s3.go
-//
-// S3 is an ObjectStore backed by AWS S3 or an S3-compatible store (MinIO, etc.).
-//
-// Conditional writes rely on S3's If-None-Match / If-Match preconditions:
-// PutCreate sends If-None-Match: "*", PutUpdate sends If-Match: <etag>. These
-// are supported by AWS S3 (since Nov 2024) and by recent MinIO releases; an
-// older S3-compatible store that ignores the preconditions will silently break
-// the CAS protocol, so verify support before relying on it.
-//
-// Adapted from the opendata-go objstore bindings, mapped onto this package's
-// PutOpts / List / ObjectMeta surface.
 // s3API is the narrow subset of the S3 client the adapter uses. *s3.Client
 // satisfies it; tests inject a fake with in-memory conditional-write semantics
 // so the adapter's header-setting and error-mapping are covered without a live
@@ -36,6 +29,15 @@ type s3API interface {
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
+// S3 is an ObjectStore backed by AWS S3 or an S3-compatible store (MinIO,
+// etc.). Adapted from the opendata-go objstore bindings, mapped onto this
+// package's PutOpts / List / ObjectMeta surface.
+//
+// Conditional writes rely on S3's If-None-Match / If-Match preconditions:
+// PutCreate sends If-None-Match: "*", PutUpdate sends If-Match: <etag>. These
+// are supported by AWS S3 (since Nov 2024) and by recent MinIO releases; an
+// older S3-compatible store that ignores the preconditions will silently break
+// the CAS protocol, so verify support before relying on it.
 type S3 struct {
 	client s3API
 	bucket string
@@ -115,6 +117,9 @@ func (s *S3) PutOpts(ctx context.Context, path string, data []byte, opts PutOpti
 	}
 	_, err := s.client.PutObject(ctx, input)
 	if err != nil {
+		if isConflict(err) {
+			return fmt.Errorf("%w: %w", ErrConflict, err)
+		}
 		if isPreconditionFailed(err) {
 			if opts.Mode == PutCreate {
 				return ErrAlreadyExists
@@ -173,6 +178,33 @@ func (s *S3) Delete(ctx context.Context, path string) error {
 	return err
 }
 
+// httpStatus extracts the HTTP status code from an SDK error, or 0.
+//
+// Classification uses typed errors and status codes, never substring matches
+// on the rendered message: that format is not part of the SDK's contract, and
+// a misclassification silently changes what the CAS protocol means.
+func httpStatus(err error) int {
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.HTTPStatusCode() != 0 {
+		return re.HTTPStatusCode()
+	}
+	var sre *smithyhttp.ResponseError
+	if errors.As(err, &sre) && sre.Response != nil {
+		return sre.Response.StatusCode
+	}
+	return 0
+}
+
+// apiCode returns the service-level error code (e.g. "NoSuchKey",
+// "PreconditionFailed", "ConditionalRequestConflict"), or "".
+func apiCode(err error) string {
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		return ae.ErrorCode()
+	}
+	return ""
+}
+
 func isNotFound(err error) bool {
 	var nsk *types.NoSuchKey
 	if errors.As(err, &nsk) {
@@ -182,17 +214,34 @@ func isNotFound(err error) bool {
 	if errors.As(err, &nf) {
 		return true
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "StatusCode: 404")
+	// NoSuchBucket is also 404 and must not read as "object absent", or a
+	// misconfigured bucket looks like an empty log.
+	switch apiCode(err) {
+	case "NoSuchKey", "NotFound":
+		return true
+	case "NoSuchBucket":
+		return false
+	}
+	return httpStatus(err) == 404 && apiCode(err) == ""
 }
 
+// isPreconditionFailed reports a 412: the precondition did not hold and the
+// write did not land.
 func isPreconditionFailed(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "PreconditionFailed") ||
-		strings.Contains(msg, "StatusCode: 412") ||
-		strings.Contains(msg, "StatusCode: 409") ||
-		strings.Contains(msg, "ConditionalRequestConflict") ||
-		strings.Contains(msg, "At least one of the pre-conditions")
+	if apiCode(err) == "PreconditionFailed" {
+		return true
+	}
+	return httpStatus(err) == 412
+}
+
+// isConflict reports a 409 ConditionalRequestConflict. The write did not land,
+// but unlike a 412 it says nothing about the current version, so the caller
+// must retry with backoff rather than re-plan.
+func isConflict(err error) bool {
+	if apiCode(err) == "ConditionalRequestConflict" {
+		return true
+	}
+	return httpStatus(err) == 409
 }
 
 // compile-time assertions.

@@ -3,7 +3,10 @@ package wal
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/JayJamieson/objwal/objectstore"
 )
@@ -35,6 +38,14 @@ type ReplicaConfig struct {
 	// segment, so the effective cap is "the first segment boundary at or past
 	// this count". Useful for pacing ingestion so progress is observable.
 	MaxRecordsPerPoll int
+	// Logger receives structured lifecycle events: poll/apply errors. Defaults
+	// to a text logger on stderr filtered to Warn, so a healthy replica is
+	// silent; pass your own *slog.Logger to change verbosity or destination.
+	Logger *slog.Logger
+	// Meter records applied-record and poll-duration metrics. Defaults to
+	// otel.GetMeterProvider()'s meter, a no-op until the process calls
+	// otel.SetMeterProvider.
+	Meter metric.Meter
 }
 
 func (c *ReplicaConfig) withDefaults() {
@@ -43,6 +54,9 @@ func (c *ReplicaConfig) withDefaults() {
 	}
 	if c.CursorSaveInterval <= 0 {
 		c.CursorSaveInterval = 1
+	}
+	if c.Logger == nil {
+		c.Logger = defaultLogger()
 	}
 }
 
@@ -54,6 +68,8 @@ type Replica struct {
 	os       objectstore.ObjectStore
 	apply    Applier
 	cfg      ReplicaConfig
+	log      *slog.Logger
+	metrics  *replicaMetrics
 	next     uint64
 	cursor   CursorStore
 	restored bool
@@ -62,13 +78,16 @@ type Replica struct {
 // NewReplica constructs a replica positioned at cfg.StartAfter.
 func NewReplica(os objectstore.ObjectStore, apply Applier, cfg ReplicaConfig) *Replica {
 	cfg.withDefaults()
+	log := cfg.Logger.With("wal_manifest", cfg.ManifestPath)
 	return &Replica{
-		store:  NewStore(os, cfg.ManifestPath),
-		os:     os,
-		apply:  apply,
-		cfg:    cfg,
-		next:   cfg.StartAt,
-		cursor: cfg.Cursor,
+		store:   NewStore(os, cfg.ManifestPath),
+		os:      os,
+		apply:   apply,
+		cfg:     cfg,
+		log:     log,
+		metrics: newReplicaMetrics(log, cfg.Meter),
+		next:    cfg.StartAt,
+		cursor:  cfg.Cursor,
 	}
 }
 
@@ -82,6 +101,8 @@ func (r *Replica) Next() uint64 { return r.next }
 // all of its records have been applied, so a mid-segment failure re-applies the
 // whole segment next time (hence the idempotency requirement).
 func (r *Replica) Poll(ctx context.Context) (int, error) {
+	start := time.Now()
+	defer func() { r.metrics.pollDuration.Record(ctx, time.Since(start).Seconds()) }()
 	if r.cursor != nil && !r.restored {
 		next, ok, err := r.cursor.Load(ctx)
 		if err != nil {
@@ -94,6 +115,7 @@ func (r *Replica) Poll(ctx context.Context) (int, error) {
 	}
 	m, _, ok, err := r.store.Load(ctx)
 	if err != nil {
+		r.log.Warn("poll: manifest load failed", "err", err)
 		return 0, err
 	}
 	if !ok {
@@ -119,10 +141,12 @@ func (r *Replica) Poll(ctx context.Context) (int, error) {
 	for _, e := range entries {
 		res, err := r.os.Get(ctx, e.Location)
 		if err != nil {
+			r.log.Warn("poll: segment get failed", "location", e.Location, "err", err)
 			return applied, fmt.Errorf("wal: replica get %s: %w", e.Location, err)
 		}
 		records, err := decodeSegment(res.Data)
 		if err != nil {
+			r.log.Warn("poll: segment decode failed", "location", e.Location, "err", err)
 			return applied, fmt.Errorf("wal: replica decode %s: %w", e.Location, err)
 		}
 		perRecord := e.Count > 0
@@ -136,6 +160,7 @@ func (r *Replica) Poll(ctx context.Context) (int, error) {
 			}
 			rec := Record{Sequence: recSeq, GroupMeta: groupMetaFor(e.Metadata, i), Data: data}
 			if err := r.apply.Apply(ctx, rec); err != nil {
+				r.log.Warn("poll: apply failed", "sequence", recSeq, "err", err)
 				return applied, fmt.Errorf("wal: apply seq %d: %w", recSeq, err)
 			}
 			applied++
@@ -159,6 +184,10 @@ func (r *Replica) Poll(ctx context.Context) (int, error) {
 			return applied, err
 		}
 	}
+	if applied > 0 {
+		r.metrics.applied.Add(ctx, int64(applied))
+		r.log.Debug("poll applied records", "records", applied, "next", r.next)
+	}
 	return applied, nil
 }
 
@@ -176,6 +205,7 @@ func (r *Replica) Run(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
+				r.log.Error("run stopped on poll error", "err", err)
 				return err
 			}
 		}

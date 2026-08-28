@@ -1,5 +1,7 @@
 # objwal
 
+[![CI](https://github.com/JayJamieson/objwal/actions/workflows/ci.yml/badge.svg)](https://github.com/JayJamieson/objwal/actions/workflows/ci.yml)
+
 A replication write-ahead log built on object-storage queue primitives.
 The log lives entirely in a bucket: segment objects hold the framed records, and one manifest object,
 mutated with conditional puts (CAS), is the broker-less ordering authority.
@@ -19,7 +21,7 @@ optimistic-concurrency append) and reshaped the queue into a non-destruct log:
 
 | opendata buffer (queue) | objwal (replication log) |
 |---|---|
-| Consumer dequeues (`AckThrough` deletes entries) | Replicas tail read-only; entries are retained, GC trims by retention window |
+| Consumer dequeues (`AckThrough` deletes entries) | Replicas tail read-only; entries are retained. `Manifest.TruncateThrough` can drop a snapshot-superseded prefix, but nothing in this package calls it yet - there is no automatic retention-window GC, and uploaded-then-uncommitted segments (from a halted flush) are never deleted either. Bring your own driver, or expect the bucket to grow without bound |
 | N stateless producers contend on the manifest | One epoch-fenced primary writes; failover bumps the epoch |
 | Consumer is the manifest owner | Many replicas read the same manifest concurrently (readers aren't fenced) |
 | Batch = opaque entries for a worker to drain | Segment = framed records a replica applies via an `Applier` |
@@ -153,6 +155,43 @@ wasn't persisted before a crash, so the same record may arrive more than once.
 Idempotent `put`/`delete` satisfies this with no extra state. For a quick
 in-line applier without the typed split, use `wal.ApplyFunc`.
 
+### Logging and metrics
+
+Both `ProducerConfig` and `ReplicaConfig` take a `Logger *slog.Logger` and a
+`Meter metric.Meter` ([OpenTelemetry](https://pkg.go.dev/go.opentelemetry.io/otel/metric)).
+Neither is required.
+
+```go
+p, err := wal.NewProducer(ctx, store, wal.ProducerConfig{
+ ManifestPath:  "wal/manifest",
+ SegmentPrefix: "wal/seg",
+ Logger:        slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+ Meter:         otel.Meter("myapp"),
+})
+```
+
+**Logging.** Left unset, both default to a text logger on stderr filtered to
+`Warn` - a healthy producer or replica is silent. Pass your own `*slog.Logger`
+(any handler, any level) to change verbosity or destination; `Info`/`Debug`
+cover routine flow (claims, flush/poll completion), `Warn`/`Error` cover
+retries, fencing, and halts.
+
+**Metrics.** Left unset, both resolve against `otel.GetMeterProvider()`, which
+is a no-op until the process calls `otel.SetMeterProvider` - so metrics cost
+nothing unless wired up, here or globally. Instruments (see `wal/metrics.go`
+for exact names/units):
+
+| Producer | Replica |
+|---|---|
+| `append.records`, `append.bytes` - what came in | `replica.applied` - records applied |
+| `batch.records`, `batch.bytes` - segment sizing | `replica.poll.duration` - `Poll` latency |
+| `commit.count` (by outcome), `commit.duration` | |
+| `commit.retries` (by reason: load / cas_conflict / write_conflict / unknown) | |
+| `claim.count` (by outcome), `claim.retries` | |
+| `fenced`, `halted` (by outcome), `upload.failures` | |
+
+All names are prefixed `objwal.wal.`.
+
 ## Intended use & use cases
 
 objwal is the replication substrate for a single-writer storage engine that
@@ -180,29 +219,50 @@ Probably don't use in production. There are tests, they could be wrong.
 
 ## Wire formats
 
-All integers little-endian. Segment (`<prefix>/<runID>/<ordinal:016x>`):
+All integers little-endian, all footers read from the end of the object. Both
+formats are versioned and every version this package has ever written is still
+read back correctly; a re-commit upgrades an object to the current version.
+
+Segment (`<prefix>/<runID>/<ordinal:016x>`):
 
 ```text
 record block (optionally zstd):  [len u32][data] ...
-footer (7 B):  compression u8 | record_count u32 | version u16 (=1)
+footer v2 (11 B, written by default): compression u8 | record_count u32 | crc32c u32 | version u16 (=2)
+footer v1 (7 B, still read; written when ProducerConfig.LegacySegmentFormat is
+           set, for consumers that read segments as upstream buffer batches):
+           compression u8 | record_count u32 | version u16 (=1)
 ```
 
-Manifest (read from the end; the v2 snapshot block is omitted in v1):
+The crc32c in a v2 footer covers the record block plus the compression and
+count fields, so a corrupt object is rejected (`wal.ErrCorrupt`) before any
+zstd work runs. v1 segments carry no checksum.
+
+Manifest (the snapshot block is omitted in v1; the per-entry `Count` field
+was added in v3; the crc32c was added in v4):
 
 ```text
-entry: [body_len u32][sequence u64][loc_len u16][loc][md_count u32]
+entry: [body_len u32][sequence u64][count u32 (v3+)][loc_len u16][loc][md_count u32]
        per md: [start_index u32][ingestion_ms i64][payload_len u32][payload]
-snapshot block (v2 only): [loc bytes][loc_len u16][through_seq u64][created_ms i64]
-footer (22 B): entries_count u32 | next_sequence u64 | epoch u64 | version u16 (=2)
+snapshot block (v2+): [loc bytes][loc_len u16][through_seq u64][created_ms i64]
+footer v4 (26 B, written by default): entries_count u32 | next_sequence u64 | epoch u64 | crc32c u32 | version u16 (=4)
+footer v1-v3 (22 B, still read): entries_count u32 | next_sequence u64 | epoch u64 | version u16 (<=3)
 ```
 
+The v4 crc32c covers the whole object ahead of it including the entry count
+that drives the decode loop so it's verified before any entry is decoded.
+The manifest is the ordering authority, so this is the higher-stakes checksum
+of the two. A silent flip here misdirects the whole log, not one segment.
+
 The in-memory `Manifest` keeps appends O(1) (side buffer merged at serialize
-time); `TruncateThrough` drops a superseded prefix at snapshot cadence.
+time). `TruncateThrough(throughSeq)` drops the prefix fully superseded by a
+snapshot covering up to `throughSeq` - but see the GC caveat above, nothing
+calls it automatically yet.
 
 ## Benchmarks & tests
 
 ```bash
 go test -race ./...                 # unit + integration, race-clean
+golangci-lint run ./...             # same lint set CI runs (see .golangci.yml)
 ./scripts/test.sh                   # end-to-end WAL throughput over local MinIO
 BENCH_LATENCY=true ./scripts/test.sh   # per-record commit latency (p50/p90/p99)
 ```

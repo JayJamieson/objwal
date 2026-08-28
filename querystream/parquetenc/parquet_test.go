@@ -70,11 +70,11 @@ func TestEncodeRoundTrip(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 
-	fi, err := os.Open(path)
+	fi, err := os.Open(path) //nolint:gosec // test helper reading a file this test itself wrote
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fi.Close()
+	defer func() { _ = fi.Close() }()
 	st, _ := fi.Stat()
 	f, err := parquet.OpenFile(fi, st.Size())
 	if err != nil {
@@ -98,7 +98,7 @@ func TestEncodeRoundTrip(t *testing.T) {
 
 	// Read rows back; assert ascending seq and intact values.
 	r := parquet.NewGenericReader[row](f)
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	got := make([]row, f.NumRows())
 	n, err := r.Read(got)
 	if err != nil && n != len(got) {

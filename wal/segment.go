@@ -2,22 +2,39 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"math"
 
 	"github.com/klauspost/compress/zstd"
 )
 
-// Segment wire format is byte-compatible with the buffer's data batch v1, so
-// segment objects remain inspectable by the same tooling:
+// Segment wire format.
 //
-//	[ record block: repeated [len: u32 LE][bytes] ]
+// v2 (written by default):
+//
+//	[ record block: repeated [len: u32 LE][bytes], optionally zstd ]
 //	[ compression_type : u8     ]
 //	[ record_count     : u32 LE ]
-//	[ version (= 1)    : u16 LE ]
+//	[ crc32c           : u32 LE ]  <- covers everything above
+//	[ version (= 2)    : u16 LE ]
 //
-// Records are opaque []byte. This package attaches no meaning to their
-// contents; that is the Applier's concern.
+// v1 (the buffer's data batch v1, still read, and still written when
+// ProducerConfig.LegacySegmentFormat is set):
+//
+//	[ record block ][ compression_type: u8 ][ record_count: u32 LE ][ version (=1): u16 LE ]
+//
+// The checksum covers the block as stored plus the compression and count
+// fields, so a corrupt object is rejected before any zstd work. Only the
+// version field is outside the digest; it is validated structurally.
+//
+// Records are opaque []byte; their meaning is the Applier's concern.
+
+// ErrCorrupt reports that stored bytes failed their integrity check. Distinct
+// from a transport error: retrying the GET re-reads the same bad bytes, so
+// replication should stop rather than spin.
+var ErrCorrupt = errors.New("wal: checksum mismatch (corrupt object)")
 
 // Compression selects the codec applied to a segment's record block.
 type Compression uint8
@@ -28,10 +45,20 @@ const (
 )
 
 const (
-	segmentFormatVersion uint16 = 1
+	segmentFormatVersion uint16 = 2
+	segmentLegacyVersion uint16 = 1
 	recordLenSize               = 4
-	segmentFooterSize           = 1 + 4 + 2 // compression u8 + count u32 + version u16
+	segmentCompSize             = 1
+	segmentCountSize            = 4
+	segmentCRCSize              = 4
+	segmentVersionSize          = 2
+	segmentFooterSizeV1         = segmentCompSize + segmentCountSize + segmentVersionSize
+	segmentFooterSize           = segmentCompSize + segmentCountSize + segmentCRCSize + segmentVersionSize
 )
+
+// CRC-32C: hardware-accelerated on amd64/arm64 and stronger than IEEE for
+// short-burst errors.
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 var (
 	zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
@@ -39,7 +66,8 @@ var (
 )
 
 // encodeSegment serializes opaque records into the segment wire format.
-func encodeSegment(records [][]byte, comp Compression) ([]byte, error) {
+// legacy selects the v1 (buffer-compatible, unchecksummed) framing.
+func encodeSegment(records [][]byte, comp Compression, legacy bool) ([]byte, error) {
 	if len(records) > math.MaxUint32 {
 		return nil, fmt.Errorf("wal: record count %d exceeds u32 max", len(records))
 	}
@@ -64,24 +92,48 @@ func encodeSegment(records [][]byte, comp Compression) ([]byte, error) {
 	out = append(out, block...)
 	out = append(out, byte(comp))
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(records)))
-	out = binary.LittleEndian.AppendUint16(out, segmentFormatVersion)
-	return out, nil
+	if legacy {
+		return binary.LittleEndian.AppendUint16(out, segmentLegacyVersion), nil
+	}
+	out = binary.LittleEndian.AppendUint32(out, crc32.Checksum(out, castagnoli))
+	return binary.LittleEndian.AppendUint16(out, segmentFormatVersion), nil
 }
 
-// decodeSegment parses the segment wire format back into its opaque records.
+// decodeSegment parses the segment wire format back into its opaque records,
+// verifying the checksum when the object carries one.
 func decodeSegment(data []byte) ([][]byte, error) {
-	if len(data) < segmentFooterSize {
+	if len(data) < segmentFooterSizeV1 {
 		return nil, fmt.Errorf("wal: segment too small for footer")
 	}
-	footer := data[len(data)-segmentFooterSize:]
-	body := data[:len(data)-segmentFooterSize]
+	n := len(data)
+	version := binary.LittleEndian.Uint16(data[n-segmentVersionSize:])
 
-	comp := Compression(footer[0])
-	count := binary.LittleEndian.Uint32(footer[1:5])
-	version := binary.LittleEndian.Uint16(footer[5:7])
-	if version != segmentFormatVersion {
+	var body []byte
+	var comp Compression
+	var count uint32
+	switch version {
+	case segmentFormatVersion:
+		if n < segmentFooterSize {
+			return nil, fmt.Errorf("wal: segment too small for v2 footer")
+		}
+		footer := data[n-segmentFooterSize:]
+		want := binary.LittleEndian.Uint32(footer[segmentCompSize+segmentCountSize : segmentCompSize+segmentCountSize+segmentCRCSize])
+		covered := data[:n-segmentCRCSize-segmentVersionSize]
+		if got := crc32.Checksum(covered, castagnoli); got != want {
+			return nil, fmt.Errorf("%w: segment crc32c %08x, stored %08x", ErrCorrupt, got, want)
+		}
+		comp = Compression(footer[0])
+		count = binary.LittleEndian.Uint32(footer[segmentCompSize : segmentCompSize+segmentCountSize])
+		body = data[: n-segmentFooterSize : n-segmentFooterSize]
+	case segmentLegacyVersion:
+		footer := data[n-segmentFooterSizeV1:]
+		comp = Compression(footer[0])
+		count = binary.LittleEndian.Uint32(footer[segmentCompSize : segmentCompSize+segmentCountSize])
+		body = data[: n-segmentFooterSizeV1 : n-segmentFooterSizeV1]
+	default:
 		return nil, fmt.Errorf("wal: unsupported segment version %d", version)
 	}
+
 	if comp != CompressionNone && comp != CompressionZstd {
 		return nil, fmt.Errorf("wal: unsupported compression %d", comp)
 	}
@@ -98,13 +150,13 @@ func decodeSegment(data []byte) ([][]byte, error) {
 		if len(body)-off < recordLenSize {
 			return nil, fmt.Errorf("wal: truncated record length")
 		}
-		n := int(binary.LittleEndian.Uint32(body[off : off+recordLenSize]))
+		r := int(binary.LittleEndian.Uint32(body[off : off+recordLenSize]))
 		off += recordLenSize
-		if len(body)-off < n {
+		if len(body)-off < r {
 			return nil, fmt.Errorf("wal: truncated record data")
 		}
-		records = append(records, body[off:off+n:off+n])
-		off += n
+		records = append(records, body[off:off+r:off+r])
+		off += r
 	}
 	return records, nil
 }

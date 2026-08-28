@@ -56,11 +56,11 @@ func itoa(i int) string { return strconv.Itoa(i) }
 // readJSONL parses a part-*.jsonl file into (seq,val) pairs.
 func readJSONL(t *testing.T, path string) []kv {
 	t.Helper()
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec // test helper reading files this test itself wrote
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var out []kv
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
@@ -279,7 +279,7 @@ func snapshotDir(t *testing.T, dir string) map[string]string {
 	t.Helper()
 	out := map[string]string{}
 	for _, p := range listParts(t, dir) {
-		b, err := os.ReadFile(p)
+		b, err := os.ReadFile(p) //nolint:gosec // test helper reading files this test itself wrote
 		if err != nil {
 			t.Fatal(err)
 		}
